@@ -1,6 +1,26 @@
 package com.neonbear.honeybeat
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.ui.composed
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -63,25 +83,30 @@ fun CubTheme(content: @Composable () -> Unit) {
 private val BEAR = listOf(".XX..XX.", "XXXXXXXX", "XXXXXXXX", "X.XXXX.X", "XXXXXXXX", ".XXXXXX.", "..XXXX..")
 
 @Composable
+fun BearMark(modifier: Modifier = Modifier, color: Color = Color.White) {
+    Canvas(modifier) {
+        val cell = minOf(size.width, size.height) / 8f
+        val ox = (size.width - cell * 8f) / 2f
+        val oy = (size.height - cell * 7f) / 2f
+        BEAR.forEachIndexed { r, row ->
+            row.forEachIndexed { c, ch ->
+                if (ch == 'X') drawRect(
+                    color,
+                    Offset(ox + c * cell + cell * 0.1f, oy + r * cell + cell * 0.1f),
+                    GSize(cell * 0.8f, cell * 0.8f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun BearLogo(box: Dp = 44.dp) {
     Box(
         Modifier.size(box).clip(RoundedCornerShape(10.dp)).background(Cub.Black)
             .border(1.dp, Color(0xFF2E2E2E), RoundedCornerShape(10.dp)),
         contentAlignment = Alignment.Center,
-    ) {
-        Canvas(Modifier.size(box * 0.62f)) {
-            val cell = size.width / 8f
-            BEAR.forEachIndexed { r, row ->
-                row.forEachIndexed { c, ch ->
-                    if (ch == 'X') drawRect(
-                        Color.White,
-                        Offset(c * cell + cell * 0.1f, r * cell + cell * 0.1f),
-                        GSize(cell * 0.8f, cell * 0.8f),
-                    )
-                }
-            }
-        }
-    }
+    ) { BearMark(Modifier.size(box * 0.62f)) }
 }
 
 private val LETTERS = mapOf(
@@ -170,9 +195,9 @@ fun ToggleCard(title: String, sub: String, on: Boolean, onChange: (Boolean) -> U
 @Composable
 fun CubButton(text: String, primary: Boolean = false, onClick: () -> Unit) {
     Box(
-        Modifier.clip(RoundedCornerShape(4.dp))
+        Modifier.bounceClick(onClick = onClick).clip(RoundedCornerShape(4.dp))
             .background(if (primary) Cub.Accent else Cub.Button)
-            .clickable(onClick = onClick).padding(horizontal = 18.dp, vertical = 11.dp),
+            .padding(horizontal = 18.dp, vertical = 11.dp),
         contentAlignment = Alignment.Center,
     ) { Text(text, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
 }
@@ -182,5 +207,72 @@ fun PageTitle(title: String, sub: String) {
     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 12.dp)) {
         Text(title, color = Cub.Text, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
         Text(sub, color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
+    }
+}
+
+val LocalShowArt = compositionLocalOf { true }
+
+/** Click with a small press-in animation. Put it first in the modifier chain so the background scales too. */
+fun Modifier.bounceClick(scale: Float = 0.94f, onClick: () -> Unit): Modifier = composed {
+    val src = remember { MutableInteractionSource() }
+    val pressed by src.collectIsPressedAsState()
+    val s by animateFloatAsState(if (pressed) scale else 1f, tween(90), label = "press")
+    Modifier
+        .graphicsLayer { scaleX = s; scaleY = s }
+        .clickable(interactionSource = src, indication = null, onClick = onClick)
+}
+
+/** Album cover (embedded picture) with a bear placeholder. Size comes from the modifier. */
+@Composable
+fun Cover(id: Long, px: Int, modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
+    val show = LocalShowArt.current
+    val bmp by produceState<Bitmap?>(if (show) Covers.peek(id, px) else null, id, px, show) {
+        value = if (show) Covers.load(ctx, id, px) else null
+    }
+    Box(modifier.clip(RoundedCornerShape(4.dp)).background(Cub.Black), contentAlignment = Alignment.Center) {
+        Crossfade(bmp, animationSpec = tween(180), label = "cover") { b ->
+            if (b != null) {
+                Image(b.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            } else {
+                BearMark(Modifier.fillMaxSize(0.55f), Color(0xFF444444))
+            }
+        }
+    }
+}
+
+/** Three little equaliser bars, shown next to the song that is playing. */
+@Composable
+fun EqBars(active: Boolean, color: Color = Cub.Accent) {
+    val t = rememberInfiniteTransition(label = "eq")
+    val a by t.animateFloat(0.25f, 1f, infiniteRepeatable(tween(420, easing = LinearEasing), RepeatMode.Reverse), label = "a")
+    val b by t.animateFloat(0.25f, 1f, infiniteRepeatable(tween(560, easing = LinearEasing), RepeatMode.Reverse), label = "b")
+    val c by t.animateFloat(0.25f, 1f, infiniteRepeatable(tween(340, easing = LinearEasing), RepeatMode.Reverse), label = "c")
+    Canvas(Modifier.size(16.dp, 14.dp)) {
+        val bw = size.width / 5f
+        listOf(a, b, c).forEachIndexed { i, v ->
+            val h = size.height * (if (active) v else 0.3f)
+            drawRect(color, Offset(i * 2 * bw, size.height - h), GSize(bw, h))
+        }
+    }
+}
+
+@Composable
+fun TBtn(g: G, box: Dp, glyph: Dp, bg: Color, tint: Color, onClick: () -> Unit) {
+    Box(
+        Modifier.bounceClick(onClick = onClick).size(box).clip(RoundedCornerShape(4.dp)).background(bg),
+        contentAlignment = Alignment.Center,
+    ) { Glyph(g, tint, glyph) }
+}
+
+@Composable
+fun PlayPauseBtn(playing: Boolean, box: Dp, glyph: Dp, onClick: () -> Unit) {
+    Box(
+        Modifier.bounceClick(onClick = onClick).size(box).clip(RoundedCornerShape(4.dp)).background(Cub.Accent),
+        contentAlignment = Alignment.Center,
+    ) {
+        Crossfade(playing, animationSpec = tween(120), label = "pp") { p ->
+            Glyph(if (p) G.Pause else G.Play, Color.White, glyph)
+        }
     }
 }
