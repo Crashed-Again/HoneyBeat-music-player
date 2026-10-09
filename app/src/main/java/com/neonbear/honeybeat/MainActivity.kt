@@ -1,4 +1,4 @@
-package com.neonbear.cubplayer
+package com.neonbear.honeybeat
 
 import android.Manifest
 import android.content.ComponentName
@@ -9,10 +9,14 @@ import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -21,6 +25,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -40,6 +45,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
@@ -88,7 +94,9 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-enum class Page(val label: String) { Songs("Songs"), Playing("Playing"), Options("Options") }
+enum class Page(val label: String) {
+    Songs("Songs"), Playlists("Playlists"), Playing("Playing"), Options("Options")
+}
 
 /** Thin wrapper around a MediaController that talks to PlaybackService. */
 class Remote(private val ctx: Context) {
@@ -124,6 +132,7 @@ class Remote(private val ctx: Context) {
 
     fun play(list: List<Song>, index: Int) {
         val p = player ?: return
+        if (list.isEmpty()) return
         p.setMediaItems(list.map { it.toItem() }, index, 0L)
         p.prepare()
         p.play()
@@ -139,15 +148,20 @@ class Remote(private val ctx: Context) {
 fun CubApp() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val prefs = remember { ctx.getSharedPreferences("cub", Context.MODE_PRIVATE) }
+    val prefs = remember { ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE) }
 
     var page by remember { mutableStateOf(Page.Songs) }
     var shuffle by remember { mutableStateOf(prefs.getBoolean("shuffle", false)) }
     var repeatAll by remember { mutableStateOf(prefs.getBoolean("repeat", true)) }
-    var onlyCave by remember { mutableStateOf(prefs.getBoolean("onlyCave", false)) }
     var showArt by remember { mutableStateOf(prefs.getBoolean("art", true)) }
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
     var query by remember { mutableStateOf("") }
+
+    var playlists by remember { mutableStateOf(loadPlaylists(prefs)) }
+    var openName by remember { mutableStateOf<String?>(null) }
+    var addSong by remember { mutableStateOf<Song?>(null) }
+    var naming by remember { mutableStateOf(false) }
+    var pendingSong by remember { mutableStateOf<Song?>(null) }
 
     val audioPerm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
     else Manifest.permission.READ_EXTERNAL_STORAGE
@@ -180,65 +194,135 @@ fun CubApp() {
         }
     }
 
-    fun setPref(key: String, v: Boolean) = prefs.edit().putBoolean(key, v).apply()
+    BackHandler(enabled = page == Page.Playlists && openName != null) { openName = null }
 
-    val shown = remember(songs, query, onlyCave) {
+    fun setPref(key: String, v: Boolean) = prefs.edit().putBoolean(key, v).apply()
+    fun commit(l: List<Playlist>) {
+        playlists = l
+        savePlaylists(prefs, l)
+    }
+    fun createPlaylist(raw: String, first: Song?) {
+        val base = raw.trim().ifEmpty { "New playlist" }
+        var name = base
+        var n = 2
+        while (playlists.any { it.name.equals(name, true) }) name = "$base ${n++}"
+        commit(playlists + Playlist(name, listOfNotNull(first?.path)))
+    }
+    fun addTo(name: String, s: Song) = commit(playlists.map {
+        if (it.name == name && s.path !in it.paths) it.copy(paths = it.paths + s.path) else it
+    })
+
+    val shown = remember(songs, query) {
         songs.filter {
-            (!onlyCave || it.path.contains("/Music/Cave/", ignoreCase = true)) &&
-                (query.isBlank() ||
-                    it.title.contains(query, true) || it.artist.contains(query, true) || it.album.contains(query, true))
+            query.isBlank() || it.title.contains(query, true) ||
+                it.artist.contains(query, true) || it.album.contains(query, true)
         }
     }
+    val byPath = remember(songs) { songs.associateBy { it.path } }
 
     Column(Modifier.fillMaxSize().background(Cub.Panel).statusBarsPadding()) {
-        Header()
         Box(Modifier.weight(1f)) {
-            when (page) {
-                Page.Songs -> SongsPage(
-                    shown = shown, hasAccess = hasAccess, onlyCave = onlyCave,
-                    query = query, onQuery = { query = it },
-                    currentId = remote.item?.mediaId,
-                    onAllow = {
-                        val wanted = if (Build.VERSION.SDK_INT >= 33)
-                            arrayOf(Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
-                        else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-                        launcher.launch(wanted)
-                    },
-                    onPlay = { i -> remote.play(shown, i); page = Page.Playing },
-                )
-                Page.Playing -> PlayingPage(
-                    remote = remote, showArt = showArt, shuffle = shuffle, repeatAll = repeatAll,
-                    onShuffle = { shuffle = !shuffle; setPref("shuffle", shuffle) },
-                    onRepeat = { repeatAll = !repeatAll; setPref("repeat", repeatAll) },
-                )
-                Page.Options -> OptionsPage(
-                    shuffle = shuffle, repeatAll = repeatAll, onlyCave = onlyCave, showArt = showArt,
-                    onShuffle = { shuffle = it; setPref("shuffle", it) },
-                    onRepeat = { repeatAll = it; setPref("repeat", it) },
-                    onOnlyCave = { onlyCave = it; setPref("onlyCave", it) },
-                    onArt = { showArt = it; setPref("art", it) },
-                    onRescan = { rescan() },
-                    count = songs.size,
-                )
+            Crossfade(targetState = page, animationSpec = tween(150), label = "page") { p ->
+                when (p) {
+                    Page.Songs -> SongsPage(
+                        shown = shown, hasAccess = hasAccess, query = query, onQuery = { query = it },
+                        currentId = remote.item?.mediaId,
+                        onAllow = {
+                            val wanted = if (Build.VERSION.SDK_INT >= 33)
+                                arrayOf(Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+                            else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+                            launcher.launch(wanted)
+                        },
+                        onPlay = { i -> remote.play(shown, i); page = Page.Playing },
+                        onAdd = { addSong = it },
+                    )
+                    Page.Playlists -> PlaylistsPage(
+                        playlists = playlists, byPath = byPath, openName = openName,
+                        currentId = remote.item?.mediaId,
+                        onOpen = { openName = it },
+                        onBack = { openName = null },
+                        onNew = { pendingSong = null; naming = true },
+                        onPlay = { list, i -> remote.play(list, i); page = Page.Playing },
+                        onDelete = { n -> commit(playlists.filter { it.name != n }); openName = null },
+                        onRemove = { n, path ->
+                            commit(playlists.map { if (it.name == n) it.copy(paths = it.paths - path) else it })
+                        },
+                    )
+                    Page.Playing -> PlayingPage(
+                        remote = remote, showArt = showArt, shuffle = shuffle, repeatAll = repeatAll,
+                        onShuffle = { shuffle = !shuffle; setPref("shuffle", shuffle) },
+                        onRepeat = { repeatAll = !repeatAll; setPref("repeat", repeatAll) },
+                    )
+                    Page.Options -> OptionsPage(
+                        shuffle = shuffle, repeatAll = repeatAll, showArt = showArt,
+                        onShuffle = { shuffle = it; setPref("shuffle", it) },
+                        onRepeat = { repeatAll = it; setPref("repeat", it) },
+                        onArt = { showArt = it; setPref("art", it) },
+                        onRescan = { rescan() },
+                        count = songs.size,
+                    )
+                }
             }
         }
         if (remote.item != null && page != Page.Playing) MiniPlayer(remote) { page = Page.Playing }
         NavBar(page) { page = it }
     }
-}
 
-@Composable
-fun Header() {
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        BearLogo()
-        Column {
-            Text("Cub Player", color = Cub.Text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            Text("by NeonBear   v1.0.0", color = Cub.Muted, fontSize = 12.sp)
-        }
+    addSong?.let { s ->
+        AlertDialog(
+            onDismissRequest = { addSong = null },
+            containerColor = Cub.Card,
+            title = { Text("Add to playlist", color = Cub.Text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    playlists.forEach { pl ->
+                        val has = s.path in pl.paths
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)).background(Cub.Hover)
+                                .clickable { addTo(pl.name, s); addSong = null }.padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(pl.name, color = Cub.Text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f))
+                            if (has) Text("added", color = Cub.Muted, fontSize = 12.sp)
+                        }
+                    }
+                    Box(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)).border(1.dp, Cub.Accent, RoundedCornerShape(4.dp))
+                            .clickable { pendingSong = s; addSong = null; naming = true }.padding(12.dp)
+                    ) { Text("+ New playlist", color = Cub.Accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { CubButton("Cancel") { addSong = null } },
+        )
+    }
+
+    if (naming) {
+        var name by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { naming = false },
+            containerColor = Cub.Card,
+            title = { Text("New playlist", color = Cub.Text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
+            text = {
+                Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Hover).padding(12.dp)) {
+                    if (name.isEmpty()) Text("Playlist name", color = Cub.Muted, fontSize = 14.sp)
+                    BasicTextField(
+                        value = name, onValueChange = { name = it }, singleLine = true,
+                        textStyle = TextStyle(color = Cub.Text, fontSize = 14.sp),
+                        cursorBrush = SolidColor(Cub.Accent), modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            },
+            confirmButton = {
+                CubButton("Create", primary = true) {
+                    createPlaylist(name, pendingSong)
+                    pendingSong = null
+                    naming = false
+                }
+            },
+            dismissButton = { CubButton("Cancel") { pendingSong = null; naming = false } },
+        )
     }
 }
 
@@ -246,18 +330,19 @@ fun Header() {
 fun NavBar(current: Page, onPick: (Page) -> Unit) {
     Row(
         Modifier.fillMaxWidth().background(Cub.Black).navigationBarsPadding().padding(horizontal = 8.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Page.values().forEach { p ->
             val sel = p == current
+            val bg by animateColorAsState(if (sel) Color(0xFF222222) else Color.Transparent, tween(150), label = "navBg")
+            val fg by animateColorAsState(if (sel) Cub.Text else Cub.Muted, tween(150), label = "navFg")
             Box(
-                Modifier.weight(1f).clip(RoundedCornerShape(4.dp))
-                    .background(if (sel) Color(0xFF222222) else Color.Transparent)
+                Modifier.weight(1f).clip(RoundedCornerShape(4.dp)).background(bg)
                     .clickable { onPick(p) }.padding(vertical = 13.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 if (sel) Box(Modifier.align(Alignment.CenterStart).width(3.dp).height(18.dp).background(Cub.Accent))
-                Text(p.label, color = if (sel) Cub.Text else Cub.Muted, fontSize = 14.sp)
+                Text(p.label, color = fg, fontSize = 13.sp)
             }
         }
     }
@@ -265,11 +350,11 @@ fun NavBar(current: Page, onPick: (Page) -> Unit) {
 
 @Composable
 fun SongsPage(
-    shown: List<Song>, hasAccess: Boolean, onlyCave: Boolean, query: String, onQuery: (String) -> Unit,
-    currentId: String?, onAllow: () -> Unit, onPlay: (Int) -> Unit,
+    shown: List<Song>, hasAccess: Boolean, query: String, onQuery: (String) -> Unit,
+    currentId: String?, onAllow: () -> Unit, onPlay: (Int) -> Unit, onAdd: (Song) -> Unit,
 ) {
     Column(Modifier.fillMaxSize()) {
-        PageTitle("Songs", if (onlyCave) "Only what Cave downloaded to Music/Cave." else "Everything on this phone.")
+        PageTitle("Songs", "Your Cave downloads, from Music/Cave.")
         if (!hasAccess) {
             Column(
                 Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(6.dp))
@@ -277,7 +362,7 @@ fun SongsPage(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text("Allow access to your music", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Text("Cub Player needs permission to read audio files so it can list and play them.", color = Cub.Muted, fontSize = 12.sp)
+                Text("HoneyBeat needs permission to read audio files so it can list and play them.", color = Cub.Muted, fontSize = 12.sp)
                 CubButton("Allow access", primary = true, onClick = onAllow)
             }
             return@Column
@@ -297,32 +382,34 @@ fun SongsPage(
         if (shown.isEmpty()) {
             Text(
                 if (query.isNotEmpty()) "No songs match that search."
-                else "No songs found. Download some with Cave, or turn off the Music/Cave filter in Options.",
+                else "No songs in Music/Cave yet. Download some with Cave, then press Rescan in Options.",
                 color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(16.dp),
             )
         }
         LazyColumn(
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+            contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             itemsIndexed(shown, key = { _, s -> s.id }) { i, s ->
-                SongRow(s, s.id.toString() == currentId) { onPlay(i) }
+                SongRow(s, s.id.toString() == currentId, onAdd = { onAdd(s) }) { onPlay(i) }
             }
         }
     }
 }
 
 @Composable
-fun SongRow(s: Song, current: Boolean, onClick: () -> Unit) {
+fun SongRow(s: Song, current: Boolean, onAdd: (() -> Unit)?, onRemove: (() -> Unit)? = null, onClick: () -> Unit) {
+    val titleColor by animateColorAsState(if (current) Cub.Accent else Cub.Text, tween(150), label = "title")
+    val bar by animateColorAsState(if (current) Cub.Accent else Color.Transparent, tween(150), label = "bar")
     Row(
         Modifier.fillMaxWidth().height(IntrinsicSize.Min).clip(RoundedCornerShape(6.dp))
             .background(Cub.Card).clickable(onClick = onClick),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(Modifier.width(3.dp).fillMaxHeight().background(if (current) Cub.Accent else Color.Transparent))
+        Box(Modifier.width(3.dp).fillMaxHeight().background(bar))
         Column(Modifier.weight(1f).padding(horizontal = 14.dp, vertical = 12.dp)) {
             Text(
-                s.title, color = if (current) Cub.Accent else Cub.Text, fontSize = 14.sp,
+                s.title, color = titleColor, fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
             Text(
@@ -331,7 +418,84 @@ fun SongRow(s: Song, current: Boolean, onClick: () -> Unit) {
                 modifier = Modifier.padding(top = 2.dp),
             )
         }
-        Text(fmt(s.durationMs), color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(end = 14.dp))
+        Text(fmt(s.durationMs), color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(end = 4.dp))
+        if (onAdd != null) {
+            Box(Modifier.clickable(onClick = onAdd).padding(horizontal = 14.dp, vertical = 12.dp)) {
+                Text("+", color = Cub.Accent, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        if (onRemove != null) {
+            Box(Modifier.clickable(onClick = onRemove).padding(horizontal = 14.dp, vertical = 12.dp)) {
+                Text("x", color = Cub.Muted, fontSize = 18.sp)
+            }
+        }
+        if (onAdd == null && onRemove == null) Spacer(Modifier.width(10.dp))
+    }
+}
+
+@Composable
+fun PlaylistsPage(
+    playlists: List<Playlist>, byPath: Map<String, Song>, openName: String?, currentId: String?,
+    onOpen: (String) -> Unit, onBack: () -> Unit, onNew: () -> Unit,
+    onPlay: (List<Song>, Int) -> Unit, onDelete: (String) -> Unit, onRemove: (String, String) -> Unit,
+) {
+    val open = playlists.find { it.name == openName }
+    if (open == null) {
+        Column(Modifier.fillMaxSize()) {
+            PageTitle("Playlists", "Your own mixes of Cave songs.")
+            Row(Modifier.padding(horizontal = 16.dp)) { CubButton("New playlist", primary = true, onClick = onNew) }
+            if (playlists.isEmpty()) {
+                Text(
+                    "No playlists yet. Make one here, or press + on a song.",
+                    color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(16.dp),
+                )
+            }
+            LazyColumn(
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                itemsIndexed(playlists, key = { _, p -> p.name }) { _, pl ->
+                    val n = pl.paths.count { byPath.containsKey(it) }
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card)
+                            .clickable { onOpen(pl.name) }.padding(horizontal = 16.dp, vertical = 14.dp)
+                    ) {
+                        Text(pl.name, color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(if (n == 1) "1 song" else "$n songs", color = Cub.Muted, fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 3.dp))
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    val list = open.paths.mapNotNull { byPath[it] }
+    Column(Modifier.fillMaxSize()) {
+        Text(
+            "< Playlists", color = Cub.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.clickable(onClick = onBack).padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 4.dp),
+        )
+        PageTitle(open.name, if (list.size == 1) "1 song" else "${list.size} songs")
+        Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            CubButton("Play", primary = true) { onPlay(list, 0) }
+            CubButton("Delete playlist") { onDelete(open.name) }
+        }
+        if (list.isEmpty()) {
+            Text("Empty. Press + on a song in Songs to add it.", color = Cub.Muted, fontSize = 13.sp,
+                modifier = Modifier.padding(16.dp))
+        }
+        LazyColumn(
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            itemsIndexed(list, key = { _, s -> s.id }) { i, s ->
+                SongRow(s, s.id.toString() == currentId, onAdd = null, onRemove = { onRemove(open.name, s.path) }) {
+                    onPlay(list, i)
+                }
+            }
+        }
     }
 }
 
@@ -361,10 +525,11 @@ fun MiniPlayer(remote: Remote, onOpen: () -> Unit) {
 
 @Composable
 fun Chip(text: String, on: Boolean, onClick: () -> Unit) {
+    val c by animateColorAsState(if (on) Cub.Accent else Cub.Muted, tween(150), label = "chip")
     Box(
         Modifier.border(1.dp, if (on) Cub.Accent else Cub.Button, RoundedCornerShape(4.dp))
             .clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 8.dp),
-    ) { Text(text, color = if (on) Cub.Accent else Cub.Muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+    ) { Text(text, color = c, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
 }
 
 @Composable
@@ -375,10 +540,8 @@ fun PlayingPage(
     val ctx = LocalContext.current
     val item = remote.item
     val player = remote.player
-    Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
-    ) {
-        PageTitle("Playing", if (item == null) "Nothing yet." else "Now playing from your library.")
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        PageTitle("Playing", if (item == null) "Nothing yet." else "Now playing from Cave.")
         if (item == null) {
             Text(
                 "Pick a song on the Songs page to start.", color = Cub.Muted, fontSize = 13.sp,
@@ -405,11 +568,12 @@ fun PlayingPage(
                     .clip(RoundedCornerShape(6.dp)).background(Cub.Black),
                 contentAlignment = Alignment.Center,
             ) {
-                val bmp = art
-                if (bmp != null) {
-                    Image(bmp.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                } else {
-                    BearLogo(120.dp)
+                Crossfade(targetState = art, animationSpec = tween(200), label = "art") { bmp ->
+                    if (bmp != null) {
+                        Image(bmp.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                    } else {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { BearLogo(120.dp) }
+                    }
                 }
             }
         }
@@ -475,16 +639,15 @@ fun PlayingPage(
 
 @Composable
 fun OptionsPage(
-    shuffle: Boolean, repeatAll: Boolean, onlyCave: Boolean, showArt: Boolean,
-    onShuffle: (Boolean) -> Unit, onRepeat: (Boolean) -> Unit, onOnlyCave: (Boolean) -> Unit,
-    onArt: (Boolean) -> Unit, onRescan: () -> Unit, count: Int,
+    shuffle: Boolean, repeatAll: Boolean, showArt: Boolean,
+    onShuffle: (Boolean) -> Unit, onRepeat: (Boolean) -> Unit, onArt: (Boolean) -> Unit,
+    onRescan: () -> Unit, count: Int,
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        PageTitle("Options", "How playback and the library behave. Changes apply right away.")
+        PageTitle("Options", "How playback behaves. Changes apply right away.")
         Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             ToggleCard("Shuffle", "Play the queue in random order.", shuffle, onShuffle)
             ToggleCard("Repeat all", "Start over when the last song ends.", repeatAll, onRepeat)
-            ToggleCard("Only Music/Cave", "Hide everything except songs Cave downloaded.", onlyCave, onOnlyCave)
             ToggleCard("Show cover art", "Uses the picture embedded in the file when there is one.", showArt, onArt)
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card)
@@ -492,8 +655,8 @@ fun OptionsPage(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("Library", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                    Text("$count songs found.", color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
+                    Text("Cave library", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Text("$count songs in Music/Cave.", color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
                 }
                 CubButton("Rescan", onClick = onRescan)
             }

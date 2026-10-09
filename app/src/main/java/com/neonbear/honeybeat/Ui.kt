@@ -1,6 +1,11 @@
-package com.neonbear.cubplayer
+package com.neonbear.honeybeat
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.offset
+import androidx.compose.runtime.getValue
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -137,13 +142,12 @@ fun Glyph(g: G, color: Color, box: Dp = 24.dp) {
 
 @Composable
 fun CubSwitch(on: Boolean) {
+    val x by animateDpAsState(if (on) 24.dp else 0.dp, tween(140), label = "knob")
+    val c by animateColorAsState(if (on) Cub.Accent else Cub.Muted, tween(140), label = "knobColor")
     Box(
-        Modifier.size(46.dp, 24.dp)
-            .border(1.dp, if (on) Cub.Accent else Cub.Muted)
-            .padding(3.dp),
-        contentAlignment = if (on) Alignment.CenterEnd else Alignment.CenterStart,
+        Modifier.size(46.dp, 24.dp).border(1.dp, c).padding(3.dp),
     ) {
-        Box(Modifier.size(16.dp).background(if (on) Cub.Accent else Cub.Muted))
+        Box(Modifier.offset(x = x).size(16.dp).background(c))
     }
 }
 

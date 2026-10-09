@@ -1,30 +1,20 @@
-# Cub Player
+# HoneyBeat
 
-A small music player for Android, styled like Cub by NeonBear: dark panels, toggle cards, blue accent.
-It plays the audio files already on the phone (MP3, M4A, FLAC and so on), keeps playing with the
-screen off, and has lock-screen and notification controls. Works well with MP3s that Cave puts in `Music/Cave`.
+A small music player for Android, styled like Cub by NeonBear. It plays only the songs Cave put in
+`Music/Cave`, lets you make playlists, keeps playing with the screen off, and has notification and
+lock-screen controls.
 
-## Build the APK
+## Build the APK on GitHub
 
-Same three options as Cave for Android.
+1. Upload the contents of this folder (including the hidden `.github` folder) to a new GitHub repo.
+2. Open the **Actions** tab. The build starts by itself, or press **Run workflow** on **Build HoneyBeat APK**.
+3. When it finishes, download `HoneyBeat-apk` from the run's Artifacts, unzip it, and install `HoneyBeat.apk` on the phone.
 
-Option A, Android Studio: open this folder, wait for the sync, then **Build > Build APK(s)**.
-The file ends up in `app/build/outputs/apk/debug/`.
-
-Option B, no Android Studio setup: run `build-apk.bat`. It downloads its own Gradle 8.9 the first time.
-It needs a JDK 17 (Android Studio's bundled one is picked up automatically) and the Android SDK.
-The result is `dist\CubPlayer.apk`.
-
-Option C, no tools at all: put this folder in a GitHub repository (the `.github` folder must come with it).
-Open the repo's **Actions** tab, pick **Build Cub Player APK**, press **Run workflow**, and download
-`CubPlayer-apk` from the finished run. The log there also shows any build error.
-
-Install: copy the APK to the phone, open it, allow "install unknown apps".
+Other ways: open the folder in Android Studio and use Build > Build APK(s), or run `build-apk.bat` (result in `dist\HoneyBeat.apk`).
 
 ## Using it
 
-- **Songs**: your library, with search. Tap a song to play it and queue the list you see.
+- **Songs**: everything in Music/Cave, with search. Tap to play. Press **+** to add a song to a playlist.
+- **Playlists**: make playlists, open one to play it, remove songs with **x**, or delete it.
 - **Playing**: cover art, seek bar, previous / play / next, shuffle and repeat.
-- **Options**: toggles for shuffle, repeat all, Music/Cave only, and cover art. **Rescan** refreshes the list.
-
-First launch asks for permission to read audio (and to show the playback notification on Android 13+).
+- **Options**: shuffle, repeat all, cover art, and **Rescan** after Cave downloads new songs.

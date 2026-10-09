@@ -1,11 +1,14 @@
-package com.neonbear.cubplayer
+package com.neonbear.honeybeat
 
 import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.media3.common.MediaItem
+import android.content.SharedPreferences
 import androidx.media3.common.MediaMetadata
+import org.json.JSONArray
+import org.json.JSONObject
 
 data class Song(
     val id: Long,
@@ -45,7 +48,7 @@ fun loadSongs(ctx: Context): List<Song> {
         MediaStore.Audio.Media.DURATION,
         MediaStore.Audio.Media.DATA,
     )
-    val sel = "(${MediaStore.Audio.Media.IS_MUSIC} != 0 OR ${MediaStore.Audio.Media.DATA} LIKE '%/Music/%')" +
+    val sel = "${MediaStore.Audio.Media.DATA} LIKE '%/Music/Cave/%'" +
         " AND ${MediaStore.Audio.Media.DURATION} > 0"
     ctx.contentResolver.query(a, proj, sel, null, "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC")?.use { c ->
         val iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
@@ -73,4 +76,25 @@ fun loadSongs(ctx: Context): List<Song> {
 fun fmt(ms: Long): String {
     val s = (ms / 1000).coerceAtLeast(0)
     return "%d:%02d".format(s / 60, s % 60)
+}
+
+data class Playlist(val name: String, val paths: List<String>)
+
+fun loadPlaylists(prefs: SharedPreferences): List<Playlist> = try {
+    val arr = JSONArray(prefs.getString("playlists", "[]"))
+    (0 until arr.length()).map { i ->
+        val o = arr.getJSONObject(i)
+        val p = o.getJSONArray("paths")
+        Playlist(o.getString("name"), (0 until p.length()).map { p.getString(it) })
+    }
+} catch (_: Exception) {
+    emptyList()
+}
+
+fun savePlaylists(prefs: SharedPreferences, list: List<Playlist>) {
+    val arr = JSONArray()
+    list.forEach { pl ->
+        arr.put(JSONObject().put("name", pl.name).put("paths", JSONArray(pl.paths)))
+    }
+    prefs.edit().putString("playlists", arr.toString()).apply()
 }

@@ -29,7 +29,7 @@ if errorlevel 1 (
 )
 
 if not exist dist mkdir dist
-copy /y app\build\outputs\apk\debug\app-debug.apk dist\CubPlayer.apk >nul
+copy /y app\build\outputs\apk\debug\app-debug.apk dist\HoneyBeat.apk >nul
 echo.
-echo Done: dist\CubPlayer.apk
+echo Done: dist\HoneyBeat.apk
 pause

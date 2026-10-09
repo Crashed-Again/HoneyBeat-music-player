@@ -1,4 +1,4 @@
-package com.neonbear.cubplayer
+package com.neonbear.honeybeat
 
 import android.content.Intent
 import androidx.media3.common.AudioAttributes

@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "CubPlayer"
+rootProject.name = "HoneyBeat"
 include(":app")
