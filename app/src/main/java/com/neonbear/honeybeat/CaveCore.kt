@@ -19,11 +19,25 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /** One cloned playlist we remember, so Sync only fetches new songs. */
 data class Recent(val url: String, val name: String, val keys: List<String>)
 data class Item(val key: String, val target: String, val label: String)
 data class Resolved(val name: String, val items: List<Item>)
+data class Hit(val id: String, val title: String, val by: String, val seconds: Int)
+
+/** Songs picked from the Fetch search, waiting for the downloader. */
+object CaveQueue {
+    private val q = ArrayDeque<Item>()
+
+    @Synchronized fun add(i: Item) { q.addLast(i) }
+    @Synchronized fun take(): List<Item> { val l = q.toList(); q.clear(); return l }
+    @Synchronized fun clear() { q.clear() }
+    @Synchronized fun isEmpty() = q.isEmpty()
+}
 
 /** Everything the Cave tab shows. Written from the download service, read by Compose. */
 object CaveState {
@@ -34,6 +48,8 @@ object CaveState {
     var current by mutableStateOf("")
     var lastError by mutableStateOf("")
     var finished by mutableIntStateOf(0)
+    var updating by mutableStateOf(false)
+    var updateMsg by mutableStateOf("")
     var recents by mutableStateOf<List<Recent>>(emptyList())
     val log = mutableStateListOf<String>()
 
@@ -72,6 +88,29 @@ object CaveStore {
 object CaveEngine {
     private var ready = false
 
+    /** Cave updates yt-dlp by itself every 12 hours (can be switched off in Options). */
+    fun maybeUpdate(ctx: Context, prefs: SharedPreferences) {
+        if (!prefs.getBoolean("cave_autoupdate", true)) return
+        val last = prefs.getLong("cave_update_at", 0L)
+        if (System.currentTimeMillis() - last < 12 * 3600 * 1000L) return
+        CaveState.ui { CaveState.status = "Updating yt-dlp..." }
+        val msg = update(ctx)
+        CaveState.addLog(msg)
+        if (!msg.startsWith("Update failed")) prefs.edit().putLong("cave_update_at", System.currentTimeMillis()).apply()
+    }
+
+    /** Search YouTube for songs (no download). */
+    fun search(ctx: Context, q: String): List<Hit> {
+        init(ctx)
+        val req = YoutubeDLRequest("ytsearch15:$q")
+        req.addOption("--flat-playlist")
+        req.addOption("--print", "%(id)s|||%(title)s|||%(uploader,channel|)s|||%(duration|0)s")
+        val out = YoutubeDL.getInstance().execute(req, "cave-search").out
+        return out.lines().map { it.split("|||") }
+            .filter { it.size >= 4 && it[0].length in 8..15 }
+            .map { Hit(it[0], it[1], it[2], it[3].toDoubleOrNull()?.toInt() ?: 0) }
+    }
+
     @Synchronized
     fun init(ctx: Context) {
         if (ready) return
@@ -89,7 +128,7 @@ object CaveEngine {
     }
 }
 
-private const val PROC = "cave-dl"
+
 
 private fun httpGet(url: String): String {
     val c = URL(url).openConnection() as HttpURLConnection
@@ -121,7 +160,7 @@ private fun youtube(url: String): Resolved {
     req.addOption("--flat-playlist")
     req.addOption("--yes-playlist")
     req.addOption("--print", "%(playlist_title|)s|||%(id)s|||%(title)s")
-    val out = YoutubeDL.getInstance().execute(req, PROC).out
+    val out = YoutubeDL.getInstance().execute(req, "cave-list").out
     val rows = out.lines().filter { it.contains("|||") }.map { it.split("|||") }.filter { it.size >= 3 }
     if (rows.isEmpty()) error("No songs found. Is the playlist public?")
     val name = rows.map { it[0].trim() }.firstOrNull { it.isNotEmpty() && it != "NA" } ?: "Singles"
@@ -189,14 +228,21 @@ private fun resolve(url: String): Resolved = when {
 private fun safeName(n: String): String =
     n.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().trimEnd('.').take(80).ifEmpty { "Playlist" }
 
-private fun downloadTrack(ctx: Context, target: String, art: Boolean): File {
+private fun downloadTrack(ctx: Context, target: String, art: Boolean, m4a: Boolean, proc: String): File {
     val dir = File(ctx.cacheDir, "cave-dl/${System.nanoTime()}").apply { mkdirs() }
     fun attempt(withArt: Boolean) {
         val r = YoutubeDLRequest(target)
         r.addOption("--no-playlist")
         r.addOption("-x")
-        r.addOption("--audio-format", "mp3")
-        r.addOption("--audio-quality", "0")
+        if (m4a) {
+            // best original audio, no re-encode to a lossy format
+            r.addOption("-f", "bestaudio[ext=m4a]/bestaudio/best")
+            r.addOption("--audio-format", "m4a")
+        } else {
+            r.addOption("-f", "bestaudio/best")
+            r.addOption("--audio-format", "mp3")
+            r.addOption("--audio-quality", "320K")
+        }
         r.addOption("--embed-metadata")
         r.addOption("--no-mtime")
         if (withArt) {
@@ -204,23 +250,24 @@ private fun downloadTrack(ctx: Context, target: String, art: Boolean): File {
             r.addOption("--convert-thumbnails", "jpg")
         }
         r.addOption("-o", dir.absolutePath + "/%(title).120B.%(ext)s")
-        YoutubeDL.getInstance().execute(r, PROC)
+        YoutubeDL.getInstance().execute(r, proc)
     }
     try {
         attempt(art)
     } catch (e: Exception) {
         if (CaveJob.cancelled || !art) throw e
         dir.listFiles()?.forEach { it.delete() }
-        attempt(false) // Cave retries without cover art when it fails
+        attempt(false) // retry without cover art when it fails
     }
-    return dir.listFiles()?.firstOrNull { it.extension == "mp3" } ?: error("yt-dlp produced no MP3")
+    return dir.listFiles()?.firstOrNull { it.extension == "mp3" || it.extension == "m4a" }
+        ?: error("yt-dlp produced no audio file")
 }
 
 private fun saveToMusic(ctx: Context, f: File, folder: String) {
     val values = ContentValues().apply {
         put(MediaStore.Audio.Media.DISPLAY_NAME, f.name)
-        put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
-        put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/Cave/$folder")
+        put(MediaStore.Audio.Media.MIME_TYPE, if (f.extension == "m4a") "audio/mp4" else "audio/mpeg")
+        put(MediaStore.Audio.Media.RELATIVE_PATH, if (folder.isEmpty()) "Music/Cave" else "Music/Cave/$folder")
         put(MediaStore.Audio.Media.IS_PENDING, 1)
     }
     val resolver = ctx.contentResolver
@@ -235,66 +282,145 @@ private fun saveToMusic(ctx: Context, f: File, folder: String) {
 object CaveJob {
     @Volatile
     var cancelled = false
+    private val procs = ConcurrentHashMap.newKeySet<String>()
 
     fun cancel() {
         cancelled = true
-        try { YoutubeDL.getInstance().destroyProcessById(PROC) } catch (_: Exception) {}
+        CaveQueue.clear()
+        (procs + "cave-list").forEach {
+            try { YoutubeDL.getInstance().destroyProcessById(it) } catch (_: Exception) {}
+        }
+    }
+
+    private fun reset() {
+        cancelled = false
+        CaveState.ui {
+            CaveState.lastError = ""; CaveState.done = 0; CaveState.total = 0
+            CaveState.current = ""; CaveState.status = "Starting yt-dlp..."
+        }
+    }
+
+    private fun fail(e: Exception) {
+        val msg = (e.message ?: e.toString()).lines().lastOrNull { it.isNotBlank() } ?: "failed"
+        CaveState.addLog("error: $msg")
+        CaveState.ui { CaveState.lastError = msg; CaveState.status = "Stopped." }
+    }
+
+    private fun finish(ctx: Context) {
+        File(ctx.cacheDir, "cave-dl").deleteRecursively()
+        CaveState.ui { CaveState.finished += 1 }
     }
 
     /** Blocking. Clones a playlist (or syncs a known one) into Music/Cave/<playlist name>. */
-    fun run(ctx: Context, url: String, art: Boolean, onProgress: (String) -> Unit) {
-        cancelled = false
+    fun run(ctx: Context, url: String, onProgress: (String) -> Unit) {
+        reset()
         val prefs = ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE)
-        CaveState.ui { CaveState.running = true; CaveState.lastError = ""; CaveState.done = 0; CaveState.total = 0; CaveState.current = ""; CaveState.status = "Starting yt-dlp..." }
-        var ok = 0
-        var failed = 0
         try {
             CaveEngine.init(ctx)
+            CaveEngine.maybeUpdate(ctx, prefs)
             CaveState.ui { CaveState.status = "Reading playlist..." }
             onProgress("Reading playlist...")
             val res = resolve(url)
-            val folder = safeName(res.name)
-            val keys = (CaveStore.load(prefs).firstOrNull { it.url == url }?.keys ?: emptyList()).toMutableList()
-            val known = keys.toSet()
-            val todo = res.items.filter { it.key !in known }
-            CaveState.addLog("${res.name}: ${res.items.size} songs, ${todo.size} new")
-            if (todo.isEmpty()) {
-                CaveState.ui { CaveState.status = "${res.name} is already up to date." }
-                return
+            download(ctx, res, url, safeName(res.name), onProgress)
+        } catch (e: Exception) {
+            if (!cancelled) fail(e)
+        } finally {
+            finish(ctx)
+        }
+    }
+
+    /** Blocking. Downloads songs picked from the search into Music/Cave itself. */
+    fun runItems(ctx: Context, items: List<Item>, onProgress: (String) -> Unit) {
+        reset()
+        try {
+            CaveEngine.init(ctx)
+            download(ctx, Resolved("Songs", items), null, "", onProgress)
+        } catch (e: Exception) {
+            if (!cancelled) fail(e)
+        } finally {
+            finish(ctx)
+        }
+    }
+
+    private fun download(ctx: Context, res: Resolved, recentUrl: String?, folder: String, onProgress: (String) -> Unit) {
+        val prefs = ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE)
+        val art = prefs.getBoolean("cave_art", true)
+        val par = prefs.getInt("cave_par", 4) // 0 = every song at once
+        val m4a = prefs.getString("cave_quality", "mp3") == "m4a"
+
+        val keys = (recentUrl?.let { u -> CaveStore.load(prefs).firstOrNull { it.url == u }?.keys } ?: emptyList()).toMutableList()
+        val known = keys.toSet()
+        val todo = res.items.filter { it.key !in known }
+        CaveState.addLog("${res.name}: ${res.items.size} songs, ${todo.size} new")
+        if (todo.isEmpty()) {
+            CaveState.ui { CaveState.status = "Already up to date." }
+            return
+        }
+        CaveState.ui { CaveState.total = todo.size; CaveState.done = 0 }
+
+        val workers = (if (par <= 0) todo.size else minOf(par, todo.size)).coerceAtLeast(1)
+        val pool = Executors.newFixedThreadPool(workers)
+        val doneC = AtomicInteger()
+        val okC = AtomicInteger()
+        val failC = AtomicInteger()
+        val active = AtomicInteger()
+        val lock = Any()
+
+        fun refresh(label: String?) {
+            val d = doneC.get()
+            val a = active.get()
+            val text = "Downloading $d of ${todo.size} ($a running)"
+            CaveState.ui {
+                CaveState.done = d
+                CaveState.status = text
+                if (label != null) CaveState.current = label
             }
-            CaveState.ui { CaveState.total = todo.size }
-            for ((i, item) in todo.withIndex()) {
-                if (cancelled) break
-                CaveState.ui { CaveState.done = i; CaveState.current = item.label; CaveState.status = "Downloading ${i + 1} of ${todo.size}" }
-                onProgress("${i + 1}/${todo.size}  ${item.label}")
+            onProgress("$d/${todo.size}  ${label ?: ""}")
+        }
+
+        val futures = todo.mapIndexed { i, item ->
+            pool.submit(Runnable {
+                if (cancelled) return@Runnable
+                val proc = "cave-$i"
+                procs.add(proc)
+                active.incrementAndGet()
+                refresh(item.label)
                 try {
-                    val file = downloadTrack(ctx, item.target, art)
+                    val file = downloadTrack(ctx, item.target, art, m4a, proc)
                     saveToMusic(ctx, file, folder)
                     file.parentFile?.deleteRecursively()
-                    keys += item.key
-                    ok++
-                    val list = CaveStore.load(prefs).filter { it.url != url }
-                    val updated = listOf(Recent(url, res.name, keys.toList())) + list
-                    CaveStore.save(prefs, updated)
-                    CaveState.ui { CaveState.recents = updated }
+                    synchronized(lock) {
+                        keys += item.key
+                        if (recentUrl != null) {
+                            val list = CaveStore.load(prefs).filter { it.url != recentUrl }
+                            val updated = listOf(Recent(recentUrl, res.name, keys.toList())) + list
+                            CaveStore.save(prefs, updated)
+                            CaveState.ui { CaveState.recents = updated }
+                        }
+                    }
+                    okC.incrementAndGet()
                     CaveState.addLog("ok: ${item.label}")
                 } catch (e: Exception) {
-                    if (cancelled) break
-                    failed++
-                    val msg = (e.message ?: e.toString()).lines().lastOrNull { it.isNotBlank() } ?: "failed"
-                    CaveState.addLog("failed: ${item.label} - $msg")
-                    CaveState.ui { CaveState.lastError = "${item.label}: $msg" }
+                    if (!cancelled) {
+                        failC.incrementAndGet()
+                        val msg = (e.message ?: e.toString()).lines().lastOrNull { it.isNotBlank() } ?: "failed"
+                        CaveState.addLog("failed: ${item.label} - $msg")
+                        CaveState.ui { CaveState.lastError = "${item.label}: $msg" }
+                    }
+                } finally {
+                    procs.remove(proc)
+                    active.decrementAndGet()
+                    doneC.incrementAndGet()
+                    refresh(null)
                 }
-            }
-            val end = if (cancelled) "Stopped. $ok new." else "Done. $ok new" + if (failed > 0) ", $failed failed." else "."
-            CaveState.ui { CaveState.done = todo.size; CaveState.current = ""; CaveState.status = end }
-        } catch (e: Exception) {
-            val msg = (e.message ?: e.toString()).lines().lastOrNull { it.isNotBlank() } ?: "failed"
-            CaveState.addLog("error: $msg")
-            CaveState.ui { CaveState.lastError = msg; CaveState.status = "Stopped." }
-        } finally {
-            File(ctx.cacheDir, "cave-dl").deleteRecursively()
-            CaveState.ui { CaveState.running = false; CaveState.finished += 1 }
+            })
         }
+        futures.forEach { try { it.get() } catch (_: Exception) {} }
+        pool.shutdown()
+
+        val ok = okC.get()
+        val failed = failC.get()
+        val end = if (cancelled) "Stopped. $ok new." else "Done. $ok new" + if (failed > 0) ", $failed failed." else "."
+        CaveState.ui { CaveState.done = todo.size; CaveState.current = ""; CaveState.status = end }
     }
 }

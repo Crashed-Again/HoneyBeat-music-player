@@ -38,6 +38,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ProvideTextStyle
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -75,9 +81,24 @@ fun CubTheme(content: @Composable () -> Unit) {
             onSurface = Cub.Text,
             onBackground = Cub.Text,
         ),
-        content = content,
-    )
+    ) {
+        ProvideTextStyle(TextStyle(fontFamily = Body)) { content() }
+    }
 }
+
+/** Tektur for titles, Outfit for everything else (both SIL Open Font License, see /licenses). */
+val Display = FontFamily(
+    Font(R.font.tektur_regular, FontWeight.Normal),
+    Font(R.font.tektur_medium, FontWeight.Medium),
+    Font(R.font.tektur_medium, FontWeight.SemiBold),
+    Font(R.font.tektur_medium, FontWeight.Bold),
+)
+val Body = FontFamily(
+    Font(R.font.outfit_regular, FontWeight.Normal),
+    Font(R.font.outfit_regular, FontWeight.Medium),
+    Font(R.font.outfit_bold, FontWeight.SemiBold),
+    Font(R.font.outfit_bold, FontWeight.Bold),
+)
 
 /** The pixel bear used for the logo (same grid as the launcher icon). */
 private val BEAR = listOf(".XX..XX.", "XXXXXXXX", "XXXXXXXX", "X.XXXX.X", "XXXXXXXX", ".XXXXXX.", "..XXXX..")
@@ -205,7 +226,7 @@ fun CubButton(text: String, primary: Boolean = false, onClick: () -> Unit) {
 @Composable
 fun PageTitle(title: String, sub: String) {
     Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 12.dp)) {
-        Text(title, color = Cub.Text, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+        Text(title, color = Cub.Text, fontSize = 30.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
         Text(sub, color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
     }
 }
@@ -273,6 +294,39 @@ fun PlayPauseBtn(playing: Boolean, box: Dp, glyph: Dp, onClick: () -> Unit) {
     ) {
         Crossfade(playing, animationSpec = tween(120), label = "pp") { p ->
             Glyph(if (p) G.Pause else G.Play, Color.White, glyph)
+        }
+    }
+}
+
+/** Playlist cover: the one the user picked, or the first song's cover. */
+@Composable
+fun FolderCover(key: String, fallbackSongId: Long, modifier: Modifier = Modifier, px: Int = 160) {
+    val ctx = LocalContext.current
+    val ver = PlaylistCovers.version
+    val custom by produceState<Bitmap?>(null, key, ver) {
+        value = withContext(Dispatchers.IO) { PlaylistCovers.load(ctx, key) }
+    }
+    val c = custom
+    if (c != null) {
+        Box(modifier.clip(RoundedCornerShape(4.dp)).background(Cub.Black)) {
+            Image(c.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        }
+    } else {
+        Cover(fallbackSongId, px, modifier)
+    }
+}
+
+/** Thumbnail from the web (used for search results). */
+@Composable
+fun NetCover(url: String, modifier: Modifier = Modifier) {
+    val bmp by produceState<Bitmap?>(NetImages.peek(url), url) { value = NetImages.load(url) }
+    Box(modifier.clip(RoundedCornerShape(4.dp)).background(Cub.Black), contentAlignment = Alignment.Center) {
+        Crossfade(bmp, animationSpec = tween(180), label = "net") { b ->
+            if (b != null) {
+                Image(b.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            } else {
+                BearMark(Modifier.fillMaxSize(0.55f), Color(0xFF444444))
+            }
         }
     }
 }

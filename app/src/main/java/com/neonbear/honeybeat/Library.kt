@@ -3,14 +3,21 @@ package com.neonbear.honeybeat
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.LruCache
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 data class Song(
     val id: Long,
@@ -118,4 +125,67 @@ object Covers {
 fun fmt(ms: Long): String {
     val s = (ms / 1000).coerceAtLeast(0)
     return "%d:%02d".format(s / 60, s % 60)
+}
+
+/** Custom playlist covers picked by the user, stored as small square JPEGs in the app's files. */
+object PlaylistCovers {
+    var version by mutableIntStateOf(0)
+
+    private fun file(ctx: Context, key: String): File {
+        val dir = File(ctx.filesDir, "playlist-covers").apply { mkdirs() }
+        return File(dir, (if (key.isEmpty()) "all" else key.hashCode().toString(16)) + ".jpg")
+    }
+
+    fun has(ctx: Context, key: String) = file(ctx, key).exists()
+
+    fun load(ctx: Context, key: String): Bitmap? =
+        file(ctx, key).takeIf { it.exists() }?.let { BitmapFactory.decodeFile(it.path) }
+
+    fun save(ctx: Context, key: String, uri: Uri): Boolean = try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        while (bounds.outWidth / sample > 1600 || bounds.outHeight / sample > 1600) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+            ?: throw IllegalStateException("unreadable image")
+        val side = minOf(bmp.width, bmp.height)
+        val square = Bitmap.createBitmap(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side)
+        val out = Bitmap.createScaledBitmap(square, 600, 600, true)
+        file(ctx, key).outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        version++
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    fun remove(ctx: Context, key: String) {
+        file(ctx, key).delete()
+        version++
+    }
+}
+
+/** Small cache for the search result thumbnails. */
+object NetImages {
+    private val cache = LruCache<String, Bitmap>(80)
+    private val failed = HashSet<String>()
+
+    fun peek(url: String): Bitmap? = cache.get(url)
+
+    suspend fun load(url: String): Bitmap? {
+        cache.get(url)?.let { return it }
+        if (url in failed) return null
+        val b = withContext(Dispatchers.IO) {
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.connectTimeout = 10000
+                c.readTimeout = 10000
+                c.inputStream.use { BitmapFactory.decodeStream(it) }
+            } catch (_: Exception) {
+                null
+            }
+        }
+        if (b != null) cache.put(url, b) else failed.add(url)
+        return b
+    }
 }

@@ -18,20 +18,36 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
-/** Runs the Cave download as a foreground service so Android keeps it alive in the background. */
+/** Runs Fetch downloads as a foreground service so Android keeps them alive in the background. */
 class CaveService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
-        private const val CH = "cave"
+        private const val CH = "fetch"
         private const val ACTION_CANCEL = "cancel"
 
-        fun start(ctx: Context, url: String, art: Boolean) {
-            if (CaveState.running) return
-            CaveState.running = true
-            ContextCompat.startForegroundService(
-                ctx, Intent(ctx, CaveService::class.java).putExtra("url", url).putExtra("art", art)
-            )
+        private fun launch(ctx: Context, url: String?) {
+            val i = Intent(ctx, CaveService::class.java)
+            if (url != null) i.putExtra("url", url)
+            ContextCompat.startForegroundService(ctx, i)
+        }
+
+        /** Clone / sync a playlist link. */
+        fun start(ctx: Context, url: String) {
+            val go = synchronized(CaveQueue) {
+                if (CaveState.running) false else { CaveState.running = true; true }
+            }
+            if (go) launch(ctx, url)
+        }
+
+        /** Queue one song from the search. Starts the service if nothing is running. */
+        fun queueTrack(ctx: Context, id: String, title: String) {
+            val go = synchronized(CaveQueue) {
+                CaveQueue.add(Item("yt:$id", "https://www.youtube.com/watch?v=$id", title))
+                if (CaveState.running) false else { CaveState.running = true; true }
+            }
+            CaveState.addLog("queued: $title")
+            if (go) launch(ctx, null)
         }
     }
 
@@ -43,7 +59,7 @@ class CaveService : Service() {
         )
         return NotificationCompat.Builder(this, CH)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Cave")
+            .setContentTitle("Fetch")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -56,20 +72,31 @@ class CaveService : Service() {
             CaveJob.cancel()
             return START_NOT_STICKY
         }
-        val url = intent?.getStringExtra("url")
-        if (url == null) {
+        if (intent == null) {
             CaveState.running = false
             stopSelf()
             return START_NOT_STICKY
         }
-        val art = intent.getBooleanExtra("art", true)
+        val url = intent.getStringExtra("url")
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CH, "Cave downloads", NotificationManager.IMPORTANCE_LOW))
+        nm.createNotificationChannel(NotificationChannel(CH, "Fetch downloads", NotificationManager.IMPORTANCE_LOW))
         ServiceCompat.startForeground(this, 1, notification("Starting..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        val progress = { text: String -> nm.notify(1, notification(text)) }
         scope.launch {
             try {
-                CaveJob.run(applicationContext, url, art) { nm.notify(1, notification(it)) }
+                if (url != null) CaveJob.run(applicationContext, url, progress)
+                while (true) {
+                    val items = CaveQueue.take()
+                    if (items.isEmpty()) {
+                        val stop = synchronized(CaveQueue) {
+                            if (CaveQueue.isEmpty()) { CaveState.running = false; true } else false
+                        }
+                        if (stop) break else continue
+                    }
+                    CaveJob.runItems(applicationContext, items, progress)
+                }
             } finally {
+                CaveState.running = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
