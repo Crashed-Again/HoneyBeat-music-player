@@ -81,7 +81,8 @@ fun YouTubeLoginView(modifier: Modifier, onSignedIn: () -> Unit) {
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView, url: String?) {
-                        val onYt = url != null && (url.startsWith("https://www.youtube.com") || url.startsWith("https://m.youtube.com"))
+                        val host = try { android.net.Uri.parse(url ?: "").host ?: "" } catch (_: Exception) { "" }
+                        val onYt = host == "youtube.com" || host.endsWith(".youtube.com")
                         if (!fired && onYt && YtAuth.saveFromWebView(ctx)) {
                             fired = true
                             onSignedIn()
@@ -105,8 +106,10 @@ fun LoginPopup(onClose: () -> Unit) {
             color = Cub.Muted, fontSize = 12.sp,
         )
         Box(Modifier.fillMaxWidth().height(430.dp).clip(RoundedCornerShape(6.dp)).background(Color.White)) {
+            val ctx = LocalContext.current
             YouTubeLoginView(Modifier.fillMaxWidth().height(430.dp)) {
                 CaveState.signedIn = true
+                YtAuth.refreshName(ctx)
                 close()
             }
         }
@@ -120,7 +123,7 @@ fun LoginPrompt(st: Settings, onSignIn: () -> Unit, onClose: () -> Unit) {
     AnimatedPopup(onDismiss = onClose) { close ->
         Text("Sign in to YouTube?", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
         Text(
-            "Signing in unlocks private playlists and lets you import your own YouTube playlists. You can also do it later in Options.",
+            "YouTube often refuses downloads from signed-out apps (\"confirm you're not a bot\"). Signing in fixes that, unlocks private playlists and lets you import your music playlists. You can also do it later in Options.",
             color = Cub.Muted, fontSize = 13.sp,
         )
         ToggleCard("Don't show again", "", st.noPrompt.value) { st.noPrompt.set(it) }
@@ -140,16 +143,16 @@ fun ImportPopup(st: Settings, onClose: () -> Unit) {
     var msg by remember { mutableStateOf("") }
     LaunchedEffect(Unit) { result = withContext(Dispatchers.IO) { CaveEngine.myPlaylists(ctx) } }
     AnimatedPopup(onDismiss = onClose) { close ->
-        Text("Import from YouTube", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+        Text("Import from YouTube Music", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
         Text(
-            "Downloads the playlist with its cover and keeps it updated in the background.",
+            "Your music playlists. Downloads the playlist with its cover and keeps it updated in the background.",
             color = Cub.Muted, fontSize = 12.sp,
         )
         val r = result
         if (r == null) {
             Text("Loading your playlists...", color = Cub.Muted, fontSize = 13.sp)
         } else {
-            if (r.error != null) Text("Couldn't list all playlists: ${r.error}", color = Color(0xFFE5645F), fontSize = 12.sp)
+            if (r.error != null) Text("Couldn't list your playlists: ${r.error}", color = Color(0xFFE5645F), fontSize = 12.sp)
             Column(
                 Modifier.fillMaxWidth().heightIn(max = 340.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -209,13 +212,20 @@ fun SearchPage(st: Settings, onSignIn: () -> Unit) {
         if (st.ask.value && isMetered(ctx)) confirm = action else action()
     }
     fun clone(url: String) {
-        val u = url.trim()
-        if (u.isEmpty() || CaveState.running) return
-        guarded { CaveService.start(ctx, u, false) }
+        val u = normalizeLink(url)
+        if (u.isEmpty()) { searchMsg = "Paste a playlist link first."; return }
+        if (!looksLikeLink(u)) { searchMsg = "That doesn't look like a playlist link."; return }
+        if (CaveState.running) { searchMsg = "Another download is running. Wait for it or press Stop."; return }
+        searchMsg = ""
+        guarded {
+            if (!CaveService.start(ctx, u, false)) searchMsg = "Another download is running. Try again in a moment."
+        }
     }
     fun search() {
         val query = q.trim()
         if (query.isEmpty() || searching) return
+        // a pasted playlist link in the search box clones it instead of searching for the link text
+        if (looksLikeLink(query)) { clone(query); q = ""; return }
         searching = true
         searchMsg = "Searching..."
         scope.launch {
@@ -231,7 +241,7 @@ fun SearchPage(st: Settings, onSignIn: () -> Unit) {
     }
 
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-        PageTitle("Search", "Find a song and press Get. Files go to Music/Cave.")
+        PageTitle("Search", "Find a song and press Get. Files go to Music/HoneyBeat.")
 
         // search music + small playlist download button
         Row(
@@ -239,7 +249,7 @@ fun SearchPage(st: Settings, onSignIn: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            InputBox(q, "Search music", Modifier.weight(1f)) { q = it }
+            InputBox(q, "Search music or paste a playlist link", Modifier.weight(1f)) { q = it }
             IconBtn(IconKind.Search, 46.dp, Cub.Accent) { search() }
             IconBtn(IconKind.Download, 46.dp) { showPlaylist = true }
         }
@@ -337,7 +347,7 @@ fun SearchPage(st: Settings, onSignIn: () -> Unit) {
                 }
             }
             if (CaveState.signedIn) {
-                CubButton("Import from my YouTube") { showImport = true; close() }
+                CubButton("Import my music playlists") { showImport = true; close() }
             }
             CubButton("Cancel") { close() }
         }

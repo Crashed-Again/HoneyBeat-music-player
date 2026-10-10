@@ -27,13 +27,17 @@ data class Song(
     val album: String,
     val durationMs: Long,
     val path: String,
-    /** First folder under Music/Cave, or "" for songs directly in Music/Cave. */
+    /** First folder under Music/HoneyBeat, or "" for songs directly in Music/HoneyBeat. */
     val folder: String,
+    /** MediaStore track number (disc * 1000 + track), 0 when the file has none. */
+    val track: Int = 0,
+    /** When the file was added to the phone, in seconds since 1970. */
+    val added: Long = 0L,
 ) {
     val uri: Uri get() = songUri(id)
 }
 
-/** A Cave playlist: one folder inside Music/Cave. The key "" is the built-in All music list. */
+/** A playlist: one folder inside Music/HoneyBeat. The key "" is the built-in All music list. */
 data class Folder(val key: String, val name: String, val songs: List<Song>)
 
 fun songUri(id: Long): Uri =
@@ -51,7 +55,9 @@ fun Song.toItem(): MediaItem = MediaItem.Builder()
     )
     .build()
 
-private const val CAVE = "/Music/Cave/"
+/** Where songs live. Music/Cave is the old name of the folder; it is still read so earlier downloads keep showing up. */
+private const val HOME = "/Music/HoneyBeat/"
+private const val OLD_HOME = "/Music/Cave/"
 
 @Suppress("DEPRECATION")
 fun loadSongs(ctx: Context): List<Song> {
@@ -64,8 +70,10 @@ fun loadSongs(ctx: Context): List<Song> {
         MediaStore.Audio.Media.ALBUM,
         MediaStore.Audio.Media.DURATION,
         MediaStore.Audio.Media.DATA,
+        MediaStore.Audio.Media.TRACK,
+        MediaStore.Audio.Media.DATE_ADDED,
     )
-    val sel = "${MediaStore.Audio.Media.DATA} LIKE '%$CAVE%' AND ${MediaStore.Audio.Media.DURATION} > 0"
+    val sel = "(${MediaStore.Audio.Media.DATA} LIKE '%$HOME%' OR ${MediaStore.Audio.Media.DATA} LIKE '%$OLD_HOME%') AND ${MediaStore.Audio.Media.DURATION} > 0"
     ctx.contentResolver.query(a, proj, sel, null, "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC")?.use { c ->
         val iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
         val iTitle = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
@@ -73,10 +81,14 @@ fun loadSongs(ctx: Context): List<Song> {
         val iAlbum = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
         val iDur = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
         val iData = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
+        val iTrack = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TRACK)
+        val iAdded = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
         while (c.moveToNext()) {
             val path = c.getString(iData) ?: ""
-            val at = path.indexOf(CAVE, ignoreCase = true)
-            val rel = if (at >= 0) path.substring(at + CAVE.length) else ""
+            var at = path.indexOf(HOME, ignoreCase = true)
+            var skip = HOME.length
+            if (at < 0) { at = path.indexOf(OLD_HOME, ignoreCase = true); skip = OLD_HOME.length }
+            val rel = if (at >= 0) path.substring(at + skip) else ""
             val folder = if (rel.contains('/')) rel.substringBefore('/') else ""
             out += Song(
                 id = c.getLong(iId),
@@ -86,13 +98,69 @@ fun loadSongs(ctx: Context): List<Song> {
                 durationMs = c.getLong(iDur),
                 path = path,
                 folder = folder,
+                track = c.getInt(iTrack),
+                added = c.getLong(iAdded),
             )
         }
     }
     return out
 }
 
-/** All music first, then one playlist per folder in Music/Cave. */
+/** How a song list is ordered. Album and Artist also group the list under headers. */
+enum class SortMode(val label: String) { Title("Title"), Artist("Artist"), Album("Album"), Date("Date added") }
+
+fun sortModeOf(name: String): SortMode = SortMode.values().firstOrNull { it.name == name } ?: SortMode.Title
+
+private val NOCASE = String.CASE_INSENSITIVE_ORDER
+
+/** Inside an album (or under an artist) songs stay in track order, whichever way the groups are sorted. */
+private fun inAlbum(a: Song, b: Song): Int {
+    val byAlbum = NOCASE.compare(a.album, b.album)
+    if (byAlbum != 0) return byAlbum
+    val ta = if (a.track <= 0) Int.MAX_VALUE else a.track
+    val tb = if (b.track <= 0) Int.MAX_VALUE else b.track
+    if (ta != tb) return ta.compareTo(tb)
+    return NOCASE.compare(a.title, b.title)
+}
+
+/** [desc] false = A to Z / oldest first. true = Z to A / newest first. */
+fun sortSongs(list: List<Song>, mode: SortMode, desc: Boolean): List<Song> {
+    val d = if (desc) -1 else 1
+    val cmp: Comparator<Song> = when (mode) {
+        SortMode.Title -> Comparator { a, b -> d * NOCASE.compare(a.title, b.title) }
+        SortMode.Artist -> Comparator { a, b ->
+            val c = d * NOCASE.compare(a.artist, b.artist)
+            if (c != 0) c else inAlbum(a, b)
+        }
+        // songs without an album always go last
+        SortMode.Album -> Comparator { a, b ->
+            if (a.album.isEmpty() != b.album.isEmpty()) {
+                if (a.album.isEmpty()) 1 else -1
+            } else {
+                val c = d * NOCASE.compare(a.album, b.album)
+                if (c != 0) c else inAlbum(a, b)
+            }
+        }
+        SortMode.Date -> Comparator { a, b ->
+            val c = d * a.added.compareTo(b.added)
+            if (c != 0) c else NOCASE.compare(a.title, b.title)
+        }
+    }
+    return list.sortedWith(cmp)
+}
+
+/** Wording for the two directions, which depends on what is being sorted. */
+fun sortDirectionLabels(mode: SortMode): Pair<String, String> =
+    if (mode == SortMode.Date) "Oldest first" to "Newest first" else "A to Z" to "Z to A"
+
+/** The header a song sits under for this sort, or null when the list has no groups. */
+fun groupOf(s: Song, mode: SortMode): String? = when (mode) {
+    SortMode.Title, SortMode.Date -> null
+    SortMode.Artist -> s.artist
+    SortMode.Album -> s.album.ifEmpty { "No album" }
+}
+
+/** All music first, then one playlist per folder in Music/HoneyBeat. */
 fun buildFolders(songs: List<Song>): List<Folder> {
     val byFolder = songs.filter { it.folder.isNotEmpty() }.groupBy { it.folder }
     val sorted = byFolder.keys.sortedWith(String.CASE_INSENSITIVE_ORDER)
@@ -214,4 +282,25 @@ object NetImages {
         if (b != null) cache.put(url, b) else failed.add(url)
         return b
     }
+}
+
+/**
+ * Deletes songs from the phone. Returns the ones Android refused (files another install made, or any file on Android 11+
+ * without asking the person), plus on Android 10 the system question that allows the first of them.
+ */
+fun deleteSongs(ctx: Context, songs: List<Song>): Pair<List<Uri>, android.content.IntentSender?> {
+    val failed = ArrayList<Uri>()
+    var ask: android.content.IntentSender? = null
+    for (s in songs) {
+        val u = songUri(s.id)
+        try {
+            ctx.contentResolver.delete(u, null, null)
+        } catch (e: SecurityException) {
+            failed += u
+            if (ask == null && e is android.app.RecoverableSecurityException) ask = e.userAction.actionIntent.intentSender
+        } catch (_: Exception) {
+            failed += u
+        }
+    }
+    return failed to ask
 }

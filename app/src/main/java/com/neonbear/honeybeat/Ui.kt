@@ -83,18 +83,23 @@ object Cub {
     val Panel = Color(0xFF232323)
     val Card = Color(0xFF1B1B1B)
     val Hover = Color(0xFF2A2A2A)
-    val Accent = Color(0xFF3B82F6)
+    /** The app's blue. [Accent] is this, or the playing song's cover colour when that option is on. */
+    val AccentDefault = Color(0xFF3B82F6)
+    /** Read through a CompositionLocal, so every button and highlight redraws the moment the colour changes. */
+    val Accent: Color @Composable get() = LocalAccent.current
     val Text = Color(0xFFF2F2F2)
     val Muted = Color(0xFF8C8C8C)
     val Button = Color(0xFF3A3A3A)
     val Dot = Color(0xFF5A5A5A)
 }
 
+val LocalAccent = compositionLocalOf { Color(0xFF3B82F6) }
+
 @Composable
 fun CubTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
-            primary = Cub.Accent,
+            primary = Cub.AccentDefault,
             background = Cub.Panel,
             surface = Cub.Card,
             onSurface = Cub.Text,
@@ -350,7 +355,7 @@ fun NetCover(url: String, modifier: Modifier = Modifier) {
     }
 }
 
-enum class IconKind { Gear, Download, Down, Search }
+enum class IconKind { Gear, Download, Down, Search, Share }
 
 /** Little line icons drawn by hand so the app needs no icon library. */
 @Composable
@@ -378,6 +383,16 @@ fun Ico(kind: IconKind, color: Color, box: Dp = 22.dp) {
             IconKind.Down -> {
                 drawLine(color, Offset(w * 0.2f, h * 0.36f), Offset(w * 0.5f, h * 0.66f), sw * 1.3f, StrokeCap.Round)
                 drawLine(color, Offset(w * 0.8f, h * 0.36f), Offset(w * 0.5f, h * 0.66f), sw * 1.3f, StrokeCap.Round)
+            }
+            IconKind.Share -> {
+                val a = Offset(w * 0.76f, h * 0.2f)
+                val b = Offset(w * 0.24f, h * 0.5f)
+                val d = Offset(w * 0.76f, h * 0.8f)
+                drawLine(color, b, a, sw, StrokeCap.Round)
+                drawLine(color, b, d, sw, StrokeCap.Round)
+                drawCircle(color, w * 0.12f, a)
+                drawCircle(color, w * 0.12f, b)
+                drawCircle(color, w * 0.12f, d)
             }
             IconKind.Search -> {
                 drawCircle(color, radius = w * 0.26f, center = Offset(w * 0.42f, h * 0.42f), style = Stroke(sw * 1.2f))
