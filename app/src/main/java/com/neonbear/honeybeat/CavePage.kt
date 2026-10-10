@@ -3,6 +3,11 @@ package com.neonbear.honeybeat
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.ConnectivityManager
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -12,15 +17,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +45,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -47,8 +54,8 @@ private fun isMetered(ctx: Context): Boolean =
     ctx.getSystemService(ConnectivityManager::class.java)?.isActiveNetworkMetered == true
 
 @Composable
-private fun InputBox(value: String, hint: String, onChange: (String) -> Unit) {
-    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)).background(Cub.Hover).padding(12.dp)) {
+fun InputBox(value: String, hint: String, modifier: Modifier = Modifier, onChange: (String) -> Unit) {
+    Box(modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)).background(Cub.Hover).padding(horizontal = 12.dp, vertical = 13.dp)) {
         if (value.isEmpty()) Text(hint, color = Cub.Muted, fontSize = 14.sp)
         BasicTextField(
             value = value, onValueChange = onChange, singleLine = true,
@@ -58,12 +65,132 @@ private fun InputBox(value: String, hint: String, onChange: (String) -> Unit) {
     }
 }
 
+/** The YouTube sign-in page. Once the session cookie shows up we save it for yt-dlp and call [onSignedIn]. */
 @Composable
-fun FetchPage(askMetered: Boolean) {
+fun YouTubeLoginView(modifier: Modifier, onSignedIn: () -> Unit) {
+    var fired = false
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            WebView(ctx).apply {
+                layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.userAgentString = YtAuth.UA
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String?) {
+                        val onYt = url != null && (url.startsWith("https://www.youtube.com") || url.startsWith("https://m.youtube.com"))
+                        if (!fired && onYt && YtAuth.saveFromWebView(ctx)) {
+                            fired = true
+                            onSignedIn()
+                        }
+                    }
+                }
+                loadUrl(YtAuth.LOGIN_URL)
+            }
+        },
+        onRelease = { it.destroy() },
+    )
+}
+
+/** Sign-in popup with the YouTube page inside. */
+@Composable
+fun LoginPopup(onClose: () -> Unit) {
+    AnimatedPopup(onDismiss = onClose) { close ->
+        Text("Sign in to YouTube", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+        Text(
+            "Used for private playlists, search and playlist links. Yt-dlp can get an account rate-limited, so a spare Google account is safer.",
+            color = Cub.Muted, fontSize = 12.sp,
+        )
+        Box(Modifier.fillMaxWidth().height(430.dp).clip(RoundedCornerShape(6.dp)).background(Color.White)) {
+            YouTubeLoginView(Modifier.fillMaxWidth().height(430.dp)) {
+                CaveState.signedIn = true
+                close()
+            }
+        }
+        CubButton("Cancel") { close() }
+    }
+}
+
+/** Shown once per launch on the Search tab while signed out. */
+@Composable
+fun LoginPrompt(st: Settings, onSignIn: () -> Unit, onClose: () -> Unit) {
+    AnimatedPopup(onDismiss = onClose) { close ->
+        Text("Sign in to YouTube?", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+        Text(
+            "Signing in unlocks private playlists and lets you import your own YouTube playlists. You can also do it later in Options.",
+            color = Cub.Muted, fontSize = 13.sp,
+        )
+        ToggleCard("Don't show again", "", st.noPrompt.value) { st.noPrompt.set(it) }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            CubButton("Sign in", primary = true) { close(); onSignIn() }
+            CubButton("Not now") { close() }
+        }
+    }
+}
+
+/** Lists the signed-in user's playlists; Import downloads one, saves its cover and keeps it updated. */
+@Composable
+fun ImportPopup(st: Settings, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    var result by remember { mutableStateOf<MyPlaylists?>(null) }
+    var started by remember { mutableStateOf<List<String>>(emptyList()) }
+    var msg by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { result = withContext(Dispatchers.IO) { CaveEngine.myPlaylists(ctx) } }
+    AnimatedPopup(onDismiss = onClose) { close ->
+        Text("Import from YouTube", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+        Text(
+            "Downloads the playlist with its cover and keeps it updated in the background.",
+            color = Cub.Muted, fontSize = 12.sp,
+        )
+        val r = result
+        if (r == null) {
+            Text("Loading your playlists...", color = Cub.Muted, fontSize = 13.sp)
+        } else {
+            if (r.error != null) Text("Couldn't list all playlists: ${r.error}", color = Color(0xFFE5645F), fontSize = 12.sp)
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 340.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                r.items.forEach { pl ->
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Hover).padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(pl.title, color = Cub.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        val done = pl.url in started
+                        CubButton(if (done) "Started" else "Import", primary = !done) {
+                            if (!done) {
+                                st.watch.set(true)
+                                if (CaveService.start(ctx, pl.url, true)) {
+                                    started = started + pl.url
+                                    msg = ""
+                                    WatchService.sync(ctx)
+                                } else msg = "Another download is running. Try again in a moment."
+                            }
+                        }
+                    }
+                }
+            }
+            if (msg.isNotEmpty()) Text(msg, color = Cub.Muted, fontSize = 12.sp)
+        }
+        CubButton("Close") { close() }
+    }
+}
+
+@Composable
+fun SearchPage(st: Settings, onSignIn: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var link by remember { mutableStateOf("") }
+    var showPlaylist by remember { mutableStateOf(false) }
+    var showImport by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var showPrompt by remember { mutableStateOf(false) }
 
     var q by remember { mutableStateOf("") }
     var hits by remember { mutableStateOf<List<Hit>>(emptyList()) }
@@ -71,13 +198,20 @@ fun FetchPage(askMetered: Boolean) {
     var searchMsg by remember { mutableStateOf("") }
     val queued = remember { mutableStateListOf<String>() }
 
+    LaunchedEffect(Unit) {
+        if (!CaveState.signedIn && !st.noPrompt.value && !CaveState.promptShown) {
+            CaveState.promptShown = true
+            showPrompt = true
+        }
+    }
+
     fun guarded(action: () -> Unit) {
-        if (askMetered && isMetered(ctx)) confirm = action else action()
+        if (st.ask.value && isMetered(ctx)) confirm = action else action()
     }
     fun clone(url: String) {
         val u = url.trim()
         if (u.isEmpty() || CaveState.running) return
-        guarded { CaveService.start(ctx, u) }
+        guarded { CaveService.start(ctx, u, false) }
     }
     fun search() {
         val query = q.trim()
@@ -90,48 +224,36 @@ fun FetchPage(askMetered: Boolean) {
                 hits = r
                 searchMsg = if (r.isEmpty()) "No results." else ""
             } catch (e: Exception) {
-                searchMsg = (e.message ?: "Search failed").lines().lastOrNull { it.isNotBlank() } ?: "Search failed"
+                searchMsg = errText(e)
             }
             searching = false
         }
     }
 
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-        PageTitle("Fetch", "Clone a playlist link or search for a song. Files go to Music/Cave.")
+        PageTitle("Search", "Find a song and press Get. Files go to Music/Cave.")
 
-        // playlist link
-        Column(
-            Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(6.dp))
-                .background(Cub.Card).padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+        // search music + small playlist download button
+        Row(
+            Modifier.padding(horizontal = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Playlist link", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-            InputBox(link, "YouTube Music, Spotify or Apple Music link") { link = it }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                CubButton("Clone", primary = true) { clone(link) }
-                CubButton("Paste") {
-                    val cm = ctx.getSystemService(ClipboardManager::class.java)
-                    val t = cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString()
-                    if (!t.isNullOrBlank()) link = t.trim()
-                }
-            }
+            InputBox(q, "Search music", Modifier.weight(1f)) { q = it }
+            IconBtn(IconKind.Search, 46.dp, Cub.Accent) { search() }
+            IconBtn(IconKind.Download, 46.dp) { showPlaylist = true }
+        }
+        if (searchMsg.isNotEmpty()) {
+            Text(searchMsg, color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, top = 8.dp))
         }
 
-        // song search
         Column(
-            Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth().clip(RoundedCornerShape(6.dp))
-                .background(Cub.Card).padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            Modifier.padding(horizontal = 16.dp, vertical = 12.dp).fillMaxWidth().animateContentSize(),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text("Search music", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-            InputBox(q, "Song or artist") { q = it }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                CubButton(if (searching) "Searching..." else "Search", primary = true) { search() }
-            }
-            if (searchMsg.isNotEmpty()) Text(searchMsg, color = Cub.Muted, fontSize = 12.sp)
             hits.forEach { h ->
                 Row(
-                    Modifier.fillMaxWidth(),
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card).padding(10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
@@ -160,8 +282,8 @@ fun FetchPage(askMetered: Boolean) {
             if (CaveState.total > 0) CaveState.done.toFloat() / CaveState.total else 0f, tween(250), label = "prog"
         )
         Column(
-            Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth().clip(RoundedCornerShape(6.dp))
-                .background(Cub.Card).padding(14.dp),
+            Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(6.dp))
+                .background(Cub.Card).padding(14.dp).animateContentSize(),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(CaveState.status, color = Cub.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
@@ -180,32 +302,6 @@ fun FetchPage(askMetered: Boolean) {
                 Text("Last error: ${CaveState.lastError}", color = Color(0xFFE5645F), fontSize = 12.sp)
             }
             if (CaveState.running) CubButton("Stop") { CaveJob.cancel() }
-        }
-
-        // recent playlists
-        if (CaveState.recents.isNotEmpty()) {
-            Text("Recent playlists", color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 6.dp))
-            Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                CaveState.recents.forEach { r ->
-                    Row(
-                        Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card).padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(r.name, color = Cub.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("${r.keys.size} downloaded", color = Cub.Muted, fontSize = 12.sp)
-                        }
-                        CubButton("Sync") { clone(r.url) }
-                        CubButton("Forget") {
-                            val list = CaveState.recents.filter { it.url != r.url }
-                            CaveState.recents = list
-                            CaveStore.save(ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE), list)
-                        }
-                    }
-                }
-            }
         }
 
         if (CaveState.log.isNotEmpty()) {
@@ -227,14 +323,36 @@ fun FetchPage(askMetered: Boolean) {
         )
     }
 
+    if (showPlaylist) {
+        AnimatedPopup(onDismiss = { showPlaylist = false }) { close ->
+            Text("Download a playlist", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+            Text("Paste a YouTube Music, Spotify or Apple Music playlist link.", color = Cub.Muted, fontSize = 13.sp)
+            InputBox(link, "Playlist link") { link = it }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CubButton("Download", primary = true) { clone(link); close() }
+                CubButton("Paste") {
+                    val cm = ctx.getSystemService(ClipboardManager::class.java)
+                    val t = cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString()
+                    if (!t.isNullOrBlank()) link = t.trim()
+                }
+            }
+            if (CaveState.signedIn) {
+                CubButton("Import from my YouTube") { showImport = true; close() }
+            }
+            CubButton("Cancel") { close() }
+        }
+    }
+    if (showImport) ImportPopup(st) { showImport = false }
+    if (showPrompt) LoginPrompt(st, onSignIn = onSignIn) { showPrompt = false }
+
     confirm?.let { action ->
-        AlertDialog(
-            onDismissRequest = { confirm = null },
-            containerColor = Cub.Card,
-            title = { Text("Use mobile data?", color = Cub.Text, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
-            text = { Text("You're on a metered connection. Downloads can use a lot of data.", color = Cub.Muted, fontSize = 14.sp) },
-            confirmButton = { CubButton("Download", primary = true) { confirm = null; action() } },
-            dismissButton = { CubButton("Cancel") { confirm = null } },
-        )
+        AnimatedPopup(onDismiss = { confirm = null }) { close ->
+            Text("Use mobile data?", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+            Text("You're on a metered connection. Downloads can use a lot of data.", color = Cub.Muted, fontSize = 13.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CubButton("Download", primary = true) { close(); action() }
+                CubButton("Cancel") { close() }
+            }
+        }
     }
 }

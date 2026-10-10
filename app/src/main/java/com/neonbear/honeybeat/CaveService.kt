@@ -23,21 +23,22 @@ class CaveService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
-        private const val CH = "fetch"
+        private const val CH = "downloads"
         private const val ACTION_CANCEL = "cancel"
 
-        private fun launch(ctx: Context, url: String?) {
-            val i = Intent(ctx, CaveService::class.java)
+        private fun launch(ctx: Context, url: String?, auto: Boolean) {
+            val i = Intent(ctx, CaveService::class.java).putExtra("auto", auto)
             if (url != null) i.putExtra("url", url)
             ContextCompat.startForegroundService(ctx, i)
         }
 
-        /** Clone / sync a playlist link. */
-        fun start(ctx: Context, url: String) {
+        /** Clone / sync a playlist link. Returns false when another download is already running. */
+        fun start(ctx: Context, url: String, auto: Boolean): Boolean {
             val go = synchronized(CaveQueue) {
                 if (CaveState.running) false else { CaveState.running = true; true }
             }
-            if (go) launch(ctx, url)
+            if (go) launch(ctx, url, auto)
+            return go
         }
 
         /** Queue one song from the search. Starts the service if nothing is running. */
@@ -47,7 +48,7 @@ class CaveService : Service() {
                 if (CaveState.running) false else { CaveState.running = true; true }
             }
             CaveState.addLog("queued: $title")
-            if (go) launch(ctx, null)
+            if (go) launch(ctx, null, false)
         }
     }
 
@@ -59,7 +60,7 @@ class CaveService : Service() {
         )
         return NotificationCompat.Builder(this, CH)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Fetch")
+            .setContentTitle("HoneyBeat")
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -78,13 +79,14 @@ class CaveService : Service() {
             return START_NOT_STICKY
         }
         val url = intent.getStringExtra("url")
+        val auto = intent.getBooleanExtra("auto", false)
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CH, "Fetch downloads", NotificationManager.IMPORTANCE_LOW))
+        nm.createNotificationChannel(NotificationChannel(CH, "Downloads", NotificationManager.IMPORTANCE_LOW))
         ServiceCompat.startForeground(this, 1, notification("Starting..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         val progress = { text: String -> nm.notify(1, notification(text)) }
         scope.launch {
             try {
-                if (url != null) CaveJob.run(applicationContext, url, progress)
+                if (url != null) CaveJob.run(applicationContext, url, auto, progress)
                 while (true) {
                     val items = CaveQueue.take()
                     if (items.isEmpty()) {

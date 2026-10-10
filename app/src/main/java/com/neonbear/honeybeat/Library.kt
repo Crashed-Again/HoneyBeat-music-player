@@ -4,6 +4,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -98,21 +99,40 @@ fun buildFolders(songs: List<Song>): List<Folder> {
     return listOf(Folder("", "All music", songs)) + sorted.map { Folder(it, it, byFolder.getValue(it)) }
 }
 
-/** Cached cover art thumbnails (embedded pictures, Android 10+). */
+/** Cover art: the full-size embedded picture first (sharp), MediaStore's thumbnail as a fallback. */
 object Covers {
-    private val cache = LruCache<String, Bitmap>(150)
+    private val cache = object : LruCache<String, Bitmap>((Runtime.getRuntime().maxMemory() / 8).toInt()) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
     private val missing = HashSet<String>()
 
     fun peek(id: Long, px: Int): Bitmap? = cache.get("$id:$px")
 
+    private fun embedded(ctx: Context, id: Long, px: Int): Bitmap? {
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(ctx, songUri(id))
+            val bytes = r.embeddedPicture ?: return null
+            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+            var s = 1
+            while (o.outWidth / (s * 2) >= px && o.outHeight / (s * 2) >= px) s *= 2
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = s })
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { r.release() } catch (_: Exception) {}
+        }
+    }
+
     suspend fun load(ctx: Context, id: Long, px: Int): Bitmap? {
-        if (id < 0 || Build.VERSION.SDK_INT < 29) return null
+        if (id < 0) return null
         val key = "$id:$px"
         cache.get(key)?.let { return it }
         if (key in missing) return null
         val b = withContext(Dispatchers.IO) {
-            try {
-                ctx.contentResolver.loadThumbnail(songUri(id), android.util.Size(px, px), null)
+            embedded(ctx, id, px) ?: try {
+                if (Build.VERSION.SDK_INT >= 29) ctx.contentResolver.loadThumbnail(songUri(id), android.util.Size(px, px), null) else null
             } catch (_: Exception) {
                 null
             }
@@ -149,10 +169,16 @@ object PlaylistCovers {
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
             ?: throw IllegalStateException("unreadable image")
+        saveBitmap(ctx, key, bmp)
+    } catch (_: Exception) {
+        false
+    }
+
+    fun saveBitmap(ctx: Context, key: String, bmp: Bitmap): Boolean = try {
         val side = minOf(bmp.width, bmp.height)
         val square = Bitmap.createBitmap(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side)
-        val out = Bitmap.createScaledBitmap(square, 600, 600, true)
-        file(ctx, key).outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        val out = Bitmap.createScaledBitmap(square, 800, 800, true)
+        file(ctx, key).outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 92, it) }
         version++
         true
     } catch (_: Exception) {

@@ -3,9 +3,11 @@ package com.neonbear.honeybeat
 import android.content.ContentValues
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.webkit.CookieManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -23,13 +25,15 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
-/** One cloned playlist we remember, so Sync only fetches new songs. */
-data class Recent(val url: String, val name: String, val keys: List<String>)
+/** One cloned playlist we remember, so Sync only fetches new songs. [auto] = keep it updated in the background. */
+data class Recent(val url: String, val name: String, val keys: List<String>, val auto: Boolean = false)
 data class Item(val key: String, val target: String, val label: String)
 data class Resolved(val name: String, val items: List<Item>)
 data class Hit(val id: String, val title: String, val by: String, val seconds: Int)
+data class MyPl(val url: String, val title: String)
+data class MyPlaylists(val items: List<MyPl>, val error: String?)
 
-/** Songs picked from the Fetch search, waiting for the downloader. */
+/** Songs picked from the search, waiting for the downloader. */
 object CaveQueue {
     private val q = ArrayDeque<Item>()
 
@@ -39,7 +43,7 @@ object CaveQueue {
     @Synchronized fun isEmpty() = q.isEmpty()
 }
 
-/** Everything the Cave tab shows. Written from the download service, read by Compose. */
+/** Everything the Search tab shows. Written from the download service, read by Compose. */
 object CaveState {
     var running by mutableStateOf(false)
     var status by mutableStateOf("Ready.")
@@ -50,6 +54,8 @@ object CaveState {
     var finished by mutableIntStateOf(0)
     var updating by mutableStateOf(false)
     var updateMsg by mutableStateOf("")
+    var signedIn by mutableStateOf(false)
+    var promptShown by mutableStateOf(false)
     var recents by mutableStateOf<List<Recent>>(emptyList())
     val log = mutableStateListOf<String>()
 
@@ -70,7 +76,7 @@ object CaveStore {
         (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             val k = o.getJSONArray("keys")
-            Recent(o.getString("url"), o.getString("name"), (0 until k.length()).map { k.getString(it) })
+            Recent(o.getString("url"), o.getString("name"), (0 until k.length()).map { k.getString(it) }, o.optBoolean("auto", false))
         }
     } catch (_: Exception) {
         emptyList()
@@ -79,16 +85,62 @@ object CaveStore {
     fun save(p: SharedPreferences, list: List<Recent>) {
         val arr = JSONArray()
         list.forEach { r ->
-            arr.put(JSONObject().put("url", r.url).put("name", r.name).put("keys", JSONArray(r.keys)))
+            arr.put(JSONObject().put("url", r.url).put("name", r.name).put("keys", JSONArray(r.keys)).put("auto", r.auto))
         }
         p.edit().putString("cave_recents", arr.toString()).apply()
     }
 }
 
+/** YouTube login: the in-app sign-in page leaves cookies behind, we hand them to yt-dlp as a cookies file. */
+object YtAuth {
+    const val LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F"
+    const val UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+    fun file(ctx: Context) = File(ctx.filesDir, "yt-cookies.txt")
+    fun signedIn(ctx: Context) = file(ctx).exists()
+
+    /** Returns true when the WebView holds a logged-in YouTube session and the cookies file was written. */
+    fun saveFromWebView(ctx: Context): Boolean {
+        val cm = CookieManager.getInstance()
+        val yt = cm.getCookie("https://www.youtube.com") ?: return false
+        if (!yt.contains("SAPISID") && !yt.contains("__Secure-3PSID")) return false
+        val google = cm.getCookie("https://accounts.google.com") ?: ""
+        val sb = StringBuilder("# Netscape HTTP Cookie File\n")
+        fun add(raw: String, domain: String) {
+            raw.split(";").map { it.trim() }.filter { it.contains("=") }.forEach {
+                val name = it.substringBefore("=")
+                val value = it.substringAfter("=")
+                sb.append("$domain\tTRUE\t/\tTRUE\t2147483647\t$name\t$value\n")
+            }
+        }
+        add(yt, ".youtube.com")
+        add(google, ".google.com")
+        file(ctx).writeText(sb.toString())
+        return true
+    }
+
+    fun clear(ctx: Context) {
+        file(ctx).delete()
+        CookieManager.getInstance().removeAllCookies(null)
+        CookieManager.getInstance().flush()
+    }
+}
+
+private fun YoutubeDLRequest.auth(ctx: Context): YoutubeDLRequest {
+    if (YtAuth.signedIn(ctx)) addOption("--cookies", YtAuth.file(ctx).absolutePath)
+    return this
+}
+
+fun errText(e: Exception): String {
+    val t = e.message ?: e.toString()
+    val line = t.lines().lastOrNull { it.contains("ERROR", true) } ?: t.lines().lastOrNull { it.isNotBlank() } ?: "failed"
+    return line.replace(Regex("^.*?ERROR:\\s*"), "").trim().ifEmpty { "failed" }
+}
+
 object CaveEngine {
     private var ready = false
 
-    /** Cave updates yt-dlp by itself every 12 hours (can be switched off in Options). */
+    /** yt-dlp is updated by itself every 12 hours (can be switched off in Options). */
     fun maybeUpdate(ctx: Context, prefs: SharedPreferences) {
         if (!prefs.getBoolean("cave_autoupdate", true)) return
         val last = prefs.getLong("cave_update_at", 0L)
@@ -102,13 +154,35 @@ object CaveEngine {
     /** Search YouTube for songs (no download). */
     fun search(ctx: Context, q: String): List<Hit> {
         init(ctx)
-        val req = YoutubeDLRequest("ytsearch15:$q")
+        val req = YoutubeDLRequest("ytsearch15:$q").auth(ctx)
         req.addOption("--flat-playlist")
         req.addOption("--print", "%(id)s|||%(title)s|||%(uploader,channel|)s|||%(duration|0)s")
         val out = YoutubeDL.getInstance().execute(req, "cave-search").out
         return out.lines().map { it.split("|||") }
             .filter { it.size >= 4 && it[0].length in 8..15 }
             .map { Hit(it[0], it[1], it[2], it[3].toDoubleOrNull()?.toInt() ?: 0) }
+    }
+
+    /** The signed-in user's playlists (plus Liked videos and Watch later). */
+    fun myPlaylists(ctx: Context): MyPlaylists {
+        val base = listOf(
+            MyPl("https://www.youtube.com/playlist?list=LL", "Liked videos"),
+            MyPl("https://www.youtube.com/playlist?list=WL", "Watch later"),
+        )
+        return try {
+            init(ctx)
+            val req = YoutubeDLRequest("https://www.youtube.com/feed/playlists").auth(ctx)
+            req.addOption("--flat-playlist")
+            req.addOption("--print", "%(url)s|||%(title)s")
+            val out = YoutubeDL.getInstance().execute(req, "cave-mine").out
+            val found = out.lines().map { it.split("|||") }
+                .filter { it.size >= 2 && it[0].startsWith("http") && it[0].contains("list=") }
+                .map { MyPl(it[0].trim(), it[1].trim()) }
+                .filter { f -> base.none { it.url == f.url } }
+            MyPlaylists(base + found, null)
+        } catch (e: Exception) {
+            MyPlaylists(base, errText(e))
+        }
     }
 
     @Synchronized
@@ -128,15 +202,20 @@ object CaveEngine {
     }
 }
 
-
-
 private fun httpGet(url: String): String {
     val c = URL(url).openConnection() as HttpURLConnection
     c.connectTimeout = 15000
     c.readTimeout = 20000
-    c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36")
+    c.setRequestProperty("User-Agent", YtAuth.UA)
     c.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
     return c.inputStream.bufferedReader().use { it.readText() }
+}
+
+private fun httpBytes(url: String): ByteArray {
+    val c = URL(url).openConnection() as HttpURLConnection
+    c.connectTimeout = 15000
+    c.readTimeout = 20000
+    return c.inputStream.use { it.readBytes() }
 }
 
 private fun findKey(n: Any?, key: String): Any? {
@@ -155,14 +234,14 @@ private fun searchItem(prefix: String, artist: String, title: String): Item {
     return Item("$prefix:${label.lowercase()}", "ytsearch1:$label audio", label)
 }
 
-private fun youtube(url: String): Resolved {
-    val req = YoutubeDLRequest(url)
+private fun youtube(ctx: Context, url: String): Resolved {
+    val req = YoutubeDLRequest(url).auth(ctx)
     req.addOption("--flat-playlist")
     req.addOption("--yes-playlist")
     req.addOption("--print", "%(playlist_title|)s|||%(id)s|||%(title)s")
     val out = YoutubeDL.getInstance().execute(req, "cave-list").out
     val rows = out.lines().filter { it.contains("|||") }.map { it.split("|||") }.filter { it.size >= 3 }
-    if (rows.isEmpty()) error("No songs found. Is the playlist public?")
+    if (rows.isEmpty()) error("No songs found. Is the playlist public (or are you signed in)?")
     val name = rows.map { it[0].trim() }.firstOrNull { it.isNotEmpty() && it != "NA" } ?: "Singles"
     return Resolved(name, rows.map { Item("yt:${it[1]}", "https://www.youtube.com/watch?v=${it[1]}", it[2]) })
 }
@@ -219,19 +298,19 @@ private fun apple(url: String): Resolved {
     error("Couldn't read that Apple Music page. Is the playlist public?")
 }
 
-private fun resolve(url: String): Resolved = when {
+fun resolve(ctx: Context, url: String): Resolved = when {
     "spotify.com" in url -> spotify(url)
     "music.apple.com" in url || "itunes.apple.com" in url -> apple(url)
-    else -> youtube(url)
+    else -> youtube(ctx, url)
 }
 
-private fun safeName(n: String): String =
+fun safeName(n: String): String =
     n.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().trimEnd('.').take(80).ifEmpty { "Playlist" }
 
 private fun downloadTrack(ctx: Context, target: String, art: Boolean, m4a: Boolean, proc: String): File {
     val dir = File(ctx.cacheDir, "cave-dl/${System.nanoTime()}").apply { mkdirs() }
     fun attempt(withArt: Boolean) {
-        val r = YoutubeDLRequest(target)
+        val r = YoutubeDLRequest(target).auth(ctx)
         r.addOption("--no-playlist")
         r.addOption("-x")
         if (m4a) {
@@ -248,6 +327,7 @@ private fun downloadTrack(ctx: Context, target: String, art: Boolean, m4a: Boole
         if (withArt) {
             r.addOption("--embed-thumbnail")
             r.addOption("--convert-thumbnails", "jpg")
+            r.addOption("--postprocessor-args", "ThumbnailsConvertor+ffmpeg_o:-q:v 1") // best jpg quality
         }
         r.addOption("-o", dir.absolutePath + "/%(title).120B.%(ext)s")
         YoutubeDL.getInstance().execute(r, proc)
@@ -279,6 +359,9 @@ private fun saveToMusic(ctx: Context, f: File, folder: String) {
     resolver.update(uri, values, null, null)
 }
 
+/** "All" means as many as is safe: each download is a separate Python + ffmpeg process, and Android kills the app if there are too many. */
+private const val MAX_ALL = 20
+
 object CaveJob {
     @Volatile
     var cancelled = false
@@ -301,7 +384,7 @@ object CaveJob {
     }
 
     private fun fail(e: Exception) {
-        val msg = (e.message ?: e.toString()).lines().lastOrNull { it.isNotBlank() } ?: "failed"
+        val msg = errText(e)
         CaveState.addLog("error: $msg")
         CaveState.ui { CaveState.lastError = msg; CaveState.status = "Stopped." }
     }
@@ -311,8 +394,19 @@ object CaveJob {
         CaveState.ui { CaveState.finished += 1 }
     }
 
+    /** Playlist covers are the first video's thumbnail, like on YouTube. Only for YouTube playlists without a cover yet. */
+    private fun fetchCover(ctx: Context, res: Resolved, folder: String) {
+        val first = res.items.firstOrNull()?.key ?: return
+        if (!first.startsWith("yt:") || PlaylistCovers.has(ctx, folder)) return
+        try {
+            val bytes = httpBytes("https://i.ytimg.com/vi/${first.removePrefix("yt:")}/hqdefault.jpg")
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { PlaylistCovers.saveBitmap(ctx, folder, it) }
+        } catch (_: Exception) {
+        }
+    }
+
     /** Blocking. Clones a playlist (or syncs a known one) into Music/Cave/<playlist name>. */
-    fun run(ctx: Context, url: String, onProgress: (String) -> Unit) {
+    fun run(ctx: Context, url: String, auto: Boolean, onProgress: (String) -> Unit) {
         reset()
         val prefs = ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE)
         try {
@@ -320,8 +414,10 @@ object CaveJob {
             CaveEngine.maybeUpdate(ctx, prefs)
             CaveState.ui { CaveState.status = "Reading playlist..." }
             onProgress("Reading playlist...")
-            val res = resolve(url)
-            download(ctx, res, url, safeName(res.name), onProgress)
+            val res = resolve(ctx, url)
+            val folder = safeName(res.name)
+            fetchCover(ctx, res, folder)
+            download(ctx, res, url, folder, auto, onProgress)
         } catch (e: Exception) {
             if (!cancelled) fail(e)
         } finally {
@@ -334,7 +430,7 @@ object CaveJob {
         reset()
         try {
             CaveEngine.init(ctx)
-            download(ctx, Resolved("Songs", items), null, "", onProgress)
+            download(ctx, Resolved("Songs", items), null, "", false, onProgress)
         } catch (e: Exception) {
             if (!cancelled) fail(e)
         } finally {
@@ -342,23 +438,35 @@ object CaveJob {
         }
     }
 
-    private fun download(ctx: Context, res: Resolved, recentUrl: String?, folder: String, onProgress: (String) -> Unit) {
+    private fun download(ctx: Context, res: Resolved, recentUrl: String?, folder: String, auto: Boolean, onProgress: (String) -> Unit) {
         val prefs = ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE)
         val art = prefs.getBoolean("cave_art", true)
-        val par = prefs.getInt("cave_par", 4) // 0 = every song at once
+        val par = prefs.getInt("cave_par", 4) // 0 = all
         val m4a = prefs.getString("cave_quality", "mp3") == "m4a"
 
-        val keys = (recentUrl?.let { u -> CaveStore.load(prefs).firstOrNull { it.url == u }?.keys } ?: emptyList()).toMutableList()
+        val prev = recentUrl?.let { u -> CaveStore.load(prefs).firstOrNull { it.url == u } }
+        val keys = (prev?.keys ?: emptyList()).toMutableList()
+        val autoFlag = prev?.auto ?: auto
         val known = keys.toSet()
         val todo = res.items.filter { it.key !in known }
         CaveState.addLog("${res.name}: ${res.items.size} songs, ${todo.size} new")
+
+        fun saveRecent() {
+            if (recentUrl == null) return
+            val list = CaveStore.load(prefs).filter { it.url != recentUrl }
+            val updated = listOf(Recent(recentUrl, res.name, keys.toList(), autoFlag)) + list
+            CaveStore.save(prefs, updated)
+            CaveState.ui { CaveState.recents = updated }
+        }
+        saveRecent() // remembers the playlist (and its auto-update flag) even if nothing is new
+
         if (todo.isEmpty()) {
             CaveState.ui { CaveState.status = "Already up to date." }
             return
         }
         CaveState.ui { CaveState.total = todo.size; CaveState.done = 0 }
 
-        val workers = (if (par <= 0) todo.size else minOf(par, todo.size)).coerceAtLeast(1)
+        val workers = (if (par <= 0) minOf(todo.size, MAX_ALL) else minOf(par, todo.size)).coerceAtLeast(1)
         val pool = Executors.newFixedThreadPool(workers)
         val doneC = AtomicInteger()
         val okC = AtomicInteger()
@@ -381,6 +489,9 @@ object CaveJob {
         val futures = todo.mapIndexed { i, item ->
             pool.submit(Runnable {
                 if (cancelled) return@Runnable
+                // stagger the first wave so the phone isn't hit by every Python start-up at once
+                if (i < workers) try { Thread.sleep(i * 250L) } catch (_: InterruptedException) {}
+                if (cancelled) return@Runnable
                 val proc = "cave-$i"
                 procs.add(proc)
                 active.incrementAndGet()
@@ -391,19 +502,14 @@ object CaveJob {
                     file.parentFile?.deleteRecursively()
                     synchronized(lock) {
                         keys += item.key
-                        if (recentUrl != null) {
-                            val list = CaveStore.load(prefs).filter { it.url != recentUrl }
-                            val updated = listOf(Recent(recentUrl, res.name, keys.toList())) + list
-                            CaveStore.save(prefs, updated)
-                            CaveState.ui { CaveState.recents = updated }
-                        }
+                        saveRecent()
                     }
                     okC.incrementAndGet()
                     CaveState.addLog("ok: ${item.label}")
                 } catch (e: Exception) {
                     if (!cancelled) {
                         failC.incrementAndGet()
-                        val msg = (e.message ?: e.toString()).lines().lastOrNull { it.isNotBlank() } ?: "failed"
+                        val msg = errText(e)
                         CaveState.addLog("failed: ${item.label} - $msg")
                         CaveState.ui { CaveState.lastError = "${item.label}: $msg" }
                     }
@@ -422,5 +528,8 @@ object CaveJob {
         val failed = failC.get()
         val end = if (cancelled) "Stopped. $ok new." else "Done. $ok new" + if (failed > 0) ", $failed failed." else "."
         CaveState.ui { CaveState.done = todo.size; CaveState.current = ""; CaveState.status = end }
+        if (ok > 0 && !cancelled) {
+            Notifier.post(ctx, (recentUrl ?: "songs").hashCode(), res.name.ifEmpty { "Songs" }, "Downloaded $ok new song" + if (ok == 1) "" else "s")
+        }
     }
 }

@@ -2,6 +2,24 @@ package com.neonbear.honeybeat
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.PI
+import kotlin.math.sin
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -13,6 +31,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -245,18 +264,18 @@ fun Modifier.bounceClick(scale: Float = 0.94f, onClick: () -> Unit): Modifier = 
 
 /** Album cover (embedded picture) with a bear placeholder. Size comes from the modifier. */
 @Composable
-fun Cover(id: Long, px: Int, modifier: Modifier = Modifier) {
+fun Cover(id: Long, px: Int, modifier: Modifier = Modifier, corner: Dp = 4.dp) {
     val ctx = LocalContext.current
     val show = LocalShowArt.current
     val bmp by produceState<Bitmap?>(if (show) Covers.peek(id, px) else null, id, px, show) {
         value = if (show) Covers.load(ctx, id, px) else null
     }
-    Box(modifier.clip(RoundedCornerShape(4.dp)).background(Cub.Black), contentAlignment = Alignment.Center) {
+    Box(modifier.clip(RoundedCornerShape(corner)).background(Cub.Black), contentAlignment = Alignment.Center) {
         Crossfade(bmp, animationSpec = tween(180), label = "cover") { b ->
             if (b != null) {
                 Image(b.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             } else {
-                BearMark(Modifier.fillMaxSize(0.55f), Color(0xFF444444))
+                BearMark(Modifier.fillMaxSize(0.38f), Color(0xFF444444))
             }
         }
     }
@@ -325,8 +344,98 @@ fun NetCover(url: String, modifier: Modifier = Modifier) {
             if (b != null) {
                 Image(b.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             } else {
-                BearMark(Modifier.fillMaxSize(0.55f), Color(0xFF444444))
+                BearMark(Modifier.fillMaxSize(0.38f), Color(0xFF444444))
             }
+        }
+    }
+}
+
+enum class IconKind { Gear, Download, Down, Search }
+
+/** Little line icons drawn by hand so the app needs no icon library. */
+@Composable
+fun Ico(kind: IconKind, color: Color, box: Dp = 22.dp) {
+    Canvas(Modifier.size(box)) {
+        val w = size.width
+        val h = size.height
+        val sw = w * 0.09f
+        when (kind) {
+            IconKind.Gear -> {
+                drawCircle(color, radius = w * 0.3f, style = Stroke(sw))
+                drawCircle(color, radius = w * 0.11f, style = Stroke(sw))
+                repeat(8) { k ->
+                    rotate(k * 45f) {
+                        drawRect(color, Offset(w * 0.5f - sw, h * 0.5f - w * 0.45f), GSize(sw * 2f, w * 0.15f))
+                    }
+                }
+            }
+            IconKind.Download -> {
+                drawLine(color, Offset(w * 0.5f, h * 0.14f), Offset(w * 0.5f, h * 0.62f), sw * 1.2f, StrokeCap.Round)
+                drawLine(color, Offset(w * 0.3f, h * 0.44f), Offset(w * 0.5f, h * 0.64f), sw * 1.2f, StrokeCap.Round)
+                drawLine(color, Offset(w * 0.7f, h * 0.44f), Offset(w * 0.5f, h * 0.64f), sw * 1.2f, StrokeCap.Round)
+                drawLine(color, Offset(w * 0.2f, h * 0.84f), Offset(w * 0.8f, h * 0.84f), sw * 1.2f, StrokeCap.Round)
+            }
+            IconKind.Down -> {
+                drawLine(color, Offset(w * 0.2f, h * 0.36f), Offset(w * 0.5f, h * 0.66f), sw * 1.3f, StrokeCap.Round)
+                drawLine(color, Offset(w * 0.8f, h * 0.36f), Offset(w * 0.5f, h * 0.66f), sw * 1.3f, StrokeCap.Round)
+            }
+            IconKind.Search -> {
+                drawCircle(color, radius = w * 0.26f, center = Offset(w * 0.42f, h * 0.42f), style = Stroke(sw * 1.2f))
+                drawLine(color, Offset(w * 0.62f, h * 0.62f), Offset(w * 0.86f, h * 0.86f), sw * 1.3f, StrokeCap.Round)
+            }
+        }
+    }
+}
+
+@Composable
+fun IconBtn(kind: IconKind, box: Dp = 44.dp, bg: Color = Cub.Button, tint: Color = Color.White, onClick: () -> Unit) {
+    Box(
+        Modifier.bounceClick(onClick = onClick).size(box).clip(RoundedCornerShape(4.dp)).background(bg),
+        contentAlignment = Alignment.Center,
+    ) { Ico(kind, tint, box * 0.5f) }
+}
+
+/** A popup that grows in and shrinks out. [content] gets a close() that plays the exit animation. */
+@Composable
+fun AnimatedPopup(onDismiss: () -> Unit, content: @Composable (close: () -> Unit) -> Unit) {
+    var shown by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { shown = true }
+    val close: () -> Unit = {
+        scope.launch {
+            shown = false
+            delay(170)
+            onDismiss()
+        }
+    }
+    Dialog(onDismissRequest = close, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        AnimatedVisibility(
+            visible = shown,
+            enter = fadeIn(tween(160)) + scaleIn(tween(220), initialScale = 0.85f),
+            exit = fadeOut(tween(140)) + scaleOut(tween(160), targetScale = 0.9f),
+        ) {
+            Column(
+                Modifier.padding(24.dp).fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Cub.Card).padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) { content(close) }
+        }
+    }
+}
+
+/** Fake level meter: pure animation, it does not read the audio. */
+@Composable
+fun Visualizer(active: Boolean, color: Color, bars: Int = 28) {
+    val t = rememberInfiniteTransition(label = "viz")
+    val phase by t.animateFloat(0f, 1f, infiniteRepeatable(tween(1600, easing = LinearEasing)), label = "phase")
+    val level by animateFloatAsState(if (active) 1f else 0.06f, tween(450), label = "level")
+    Canvas(Modifier.fillMaxWidth().height(30.dp)) {
+        val gap = 4.dp.toPx()
+        val bw = (size.width - gap * (bars - 1)) / bars
+        for (i in 0 until bars) {
+            val a = (sin(phase * 2 * PI + i * 0.55) + 0.5 * sin(phase * 4 * PI + i * 1.3)) / 1.5
+            val v = ((0.25f + 0.75f * (a.toFloat() * 0.5f + 0.5f)) * level).coerceIn(0f, 1f)
+            val bh = (size.height * v).coerceAtLeast(3.dp.toPx())
+            drawRect(color.copy(alpha = 0.35f + 0.65f * v), Offset(i * (bw + gap), size.height - bh), GSize(bw, bh))
         }
     }
 }

@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -38,12 +39,10 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -67,15 +66,19 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -105,7 +108,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-enum class Page(val label: String) { Library("Library"), Playing("Playing"), Fetch("Fetch"), Options("Options") }
+/** Playing is not a tab: the mini player opens it as a full-screen sheet. */
+enum class Page(val label: String) { Library("Library"), Search("Search"), Options("Options") }
 
 /** Thin wrapper around a MediaController that talks to PlaybackService. */
 class Remote(private val ctx: Context) {
@@ -161,19 +165,14 @@ fun CubApp() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE) }
+    val st = remember { Settings(prefs) }
 
     var page by remember { mutableStateOf(Page.Library) }
-    var shuffle by remember { mutableStateOf(prefs.getBoolean("shuffle", false)) }
-    var repeatAll by remember { mutableStateOf(prefs.getBoolean("repeat", false)) }
-    var showArt by remember { mutableStateOf(prefs.getBoolean("art", true)) }
-    var caveArt by remember { mutableStateOf(prefs.getBoolean("cave_art", true)) }
-    var caveAsk by remember { mutableStateOf(prefs.getBoolean("cave_ask", true)) }
-    var caveAuto by remember { mutableStateOf(prefs.getBoolean("cave_autoupdate", true)) }
-    var cavePar by remember { mutableStateOf(prefs.getInt("cave_par", 4)) }
-    var caveQuality by remember { mutableStateOf(prefs.getString("cave_quality", "mp3") ?: "mp3") }
     var songs by remember { mutableStateOf<List<Song>>(emptyList()) }
     var query by remember { mutableStateOf("") }
     var openKey by remember { mutableStateOf<String?>(null) }
+    var showPlayer by remember { mutableStateOf(false) }
+    var showLogin by remember { mutableStateOf(false) }
 
     val audioPerm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
     else Manifest.permission.READ_EXTERNAL_STORAGE
@@ -198,9 +197,12 @@ fun CubApp() {
     }
     LaunchedEffect(Unit) {
         CaveState.recents = CaveStore.load(prefs)
+        CaveState.signedIn = YtAuth.signedIn(ctx)
+        WatchService.sync(ctx)
         if (hasAccess) rescan() else askPermissions()
     }
     LaunchedEffect(CaveState.finished) { if (CaveState.finished > 0) rescan() }
+    LaunchedEffect(st.watch.value) { WatchService.sync(ctx) }
 
     val remote = remember { Remote(ctx) }
     DisposableEffect(Unit) {
@@ -209,67 +211,70 @@ fun CubApp() {
     }
 
     val player = remote.player
-    LaunchedEffect(player, shuffle, repeatAll) {
+    LaunchedEffect(player, st.shuffle.value, st.repeat.value) {
         player?.let {
-            it.shuffleModeEnabled = shuffle
-            it.repeatMode = if (repeatAll) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
+            it.shuffleModeEnabled = st.shuffle.value
+            it.repeatMode = if (st.repeat.value) Player.REPEAT_MODE_ALL else Player.REPEAT_MODE_OFF
         }
     }
 
     BackHandler(enabled = page == Page.Library && openKey != null) { openKey = null; query = "" }
-    fun setPref(key: String, v: Boolean) = prefs.edit().putBoolean(key, v).apply()
+    BackHandler(enabled = showPlayer) { showPlayer = false }
 
     val folders = remember(songs) { buildFolders(songs) }
 
-    CompositionLocalProvider(LocalShowArt provides showArt) {
-        Column(Modifier.fillMaxSize().background(Cub.Panel).statusBarsPadding()) {
-            Box(Modifier.weight(1f)) {
-                AnimatedContent(
-                    targetState = page,
-                    transitionSpec = {
-                        (fadeIn(tween(200)) + slideInVertically(tween(200)) { it / 24 }) togetherWith fadeOut(tween(120))
-                    },
-                    label = "page",
-                ) { p ->
-                    when (p) {
-                        Page.Library -> LibraryPage(
-                            folders = folders, hasAccess = hasAccess, onAllow = { askPermissions() },
-                            openKey = openKey,
-                            onOpen = { openKey = it; query = "" },
-                            query = query, onQuery = { query = it },
-                            currentId = remote.item?.mediaId, playing = remote.playing,
-                            onPlay = { list, i -> remote.play(list, i) },
-                        )
-                        Page.Playing -> PlayingPage(
-                            remote = remote, shuffle = shuffle, repeatAll = repeatAll,
-                            onShuffle = { shuffle = !shuffle; setPref("shuffle", shuffle) },
-                            onRepeat = { repeatAll = !repeatAll; setPref("repeat", repeatAll) },
-                        )
-                        Page.Fetch -> FetchPage(askMetered = caveAsk)
-                        Page.Options -> OptionsPage(
-                            shuffle = shuffle, repeatAll = repeatAll, showArt = showArt, caveArt = caveArt, caveAsk = caveAsk,
-                            caveAuto = caveAuto, cavePar = cavePar, caveQuality = caveQuality,
-                            onShuffle = { shuffle = it; setPref("shuffle", it) },
-                            onRepeat = { repeatAll = it; setPref("repeat", it) },
-                            onArt = { showArt = it; setPref("art", it) },
-                            onCaveArt = { caveArt = it; setPref("cave_art", it) },
-                            onCaveAsk = { caveAsk = it; setPref("cave_ask", it) },
-                            onCaveAuto = { caveAuto = it; setPref("cave_autoupdate", it) },
-                            onCavePar = { cavePar = it; prefs.edit().putInt("cave_par", it).apply() },
-                            onCaveQuality = { caveQuality = it; prefs.edit().putString("cave_quality", it).apply() },
-                            onRescan = { rescan() },
-                            songCount = songs.size, listCount = folders.size - 1,
-                        )
+    CompositionLocalProvider(LocalShowArt provides st.art.value) {
+        Box(Modifier.fillMaxSize().background(Cub.Panel)) {
+            Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                Box(Modifier.weight(1f)) {
+                    AnimatedContent(
+                        targetState = page,
+                        transitionSpec = {
+                            (fadeIn(tween(200)) + slideInVertically(tween(200)) { it / 24 }) togetherWith fadeOut(tween(120))
+                        },
+                        label = "page",
+                    ) { p ->
+                        when (p) {
+                            Page.Library -> LibraryPage(
+                                folders = folders, hasAccess = hasAccess, onAllow = { askPermissions() },
+                                openKey = openKey,
+                                onOpen = { openKey = it; query = "" },
+                                query = query, onQuery = { query = it },
+                                currentId = remote.item?.mediaId, playing = remote.playing,
+                                onPlay = { list, i -> remote.play(list, i) },
+                                st = st, onChanged = { rescan() },
+                            )
+                            Page.Search -> SearchPage(st = st, onSignIn = { showLogin = true })
+                            Page.Options -> OptionsPage(
+                                st = st, onRescan = { rescan() },
+                                songCount = songs.size, listCount = folders.size - 1,
+                                onLogin = { showLogin = true },
+                            )
+                        }
                     }
                 }
+                AnimatedVisibility(
+                    visible = remote.item != null && !showPlayer,
+                    enter = slideInVertically(tween(220)) { it } + fadeIn(tween(220)),
+                    exit = slideOutVertically(tween(160)) { it } + fadeOut(tween(160)),
+                ) { MiniPlayer(remote) { showPlayer = true } }
+                NavBar(page) { page = it }
             }
+
             AnimatedVisibility(
-                visible = remote.item != null && page != Page.Playing,
-                enter = slideInVertically(tween(220)) { it } + fadeIn(tween(220)),
-                exit = slideOutVertically(tween(160)) { it } + fadeOut(tween(160)),
-            ) { MiniPlayer(remote) { page = Page.Playing } }
-            NavBar(page) { page = it }
+                visible = showPlayer,
+                enter = slideInVertically(tween(320)) { it } + fadeIn(tween(200)),
+                exit = slideOutVertically(tween(260)) { it } + fadeOut(tween(200)),
+            ) {
+                PlayingScreen(
+                    remote = remote, shuffle = st.shuffle.value, repeatAll = st.repeat.value,
+                    onShuffle = { st.shuffle.set(!st.shuffle.value) },
+                    onRepeat = { st.repeat.set(!st.repeat.value) },
+                    onClose = { showPlayer = false },
+                )
+            }
         }
+        if (showLogin) LoginPopup { showLogin = false }
     }
 }
 
@@ -305,12 +310,15 @@ fun SearchBox(query: String, onQuery: (String) -> Unit) {
         if (query.isEmpty()) Text("Search songs, artists, albums", color = Cub.Muted, fontSize = 14.sp)
         BasicTextField(
             value = query, onValueChange = onQuery, singleLine = true,
-            textStyle = TextStyle(color = Cub.Text, fontSize = 14.sp),
+            textStyle = TextStyle(color = Cub.Text, fontSize = 14.sp, fontFamily = Body),
             cursorBrush = SolidColor(Cub.Accent),
             modifier = Modifier.fillMaxWidth(),
         )
     }
 }
+
+private fun matches(s: Song, q: String) =
+    q.isBlank() || s.title.contains(q, true) || s.artist.contains(q, true) || s.album.contains(q, true)
 
 @Composable
 fun LibraryPage(
@@ -318,6 +326,7 @@ fun LibraryPage(
     openKey: String?, onOpen: (String?) -> Unit,
     query: String, onQuery: (String) -> Unit,
     currentId: String?, playing: Boolean, onPlay: (List<Song>, Int) -> Unit,
+    st: Settings, onChanged: () -> Unit,
 ) {
     if (!hasAccess) {
         Column(Modifier.fillMaxSize()) {
@@ -348,58 +357,121 @@ fun LibraryPage(
         label = "lib",
     ) { key ->
         if (key == null) {
+            val all = folders.first().songs
+            val found = remember(all, query) { all.filter { matches(it, query) } }
             Column(Modifier.fillMaxSize()) {
                 PageTitle("Library", "Every folder in Music/Cave is a playlist.")
-                if (folders.first().songs.isEmpty()) {
+                SearchBox(query, onQuery)
+                if (all.isEmpty()) {
                     Text(
-                        "No songs in Music/Cave yet. Clone a playlist in the Fetch tab.",
-                        color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp),
+                        "No songs in Music/Cave yet. Search or download a playlist in the Search tab.",
+                        color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(16.dp),
                     )
                 }
-                LazyColumn(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    items(folders, key = { it.key }) { f ->
-                        FolderCard(f, Modifier.animateItem()) { onOpen(f.key) }
+                if (query.isNotBlank()) {
+                    if (found.isEmpty()) {
+                        Text("No songs match that search.", color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(16.dp))
+                    }
+                    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        itemsIndexed(found, key = { _, s -> s.id }) { i, s ->
+                            SongRow(s, s.id.toString() == currentId, playing, Modifier.animateItem()) { onPlay(found, i) }
+                        }
+                    }
+                } else {
+                    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(folders, key = { it.key }) { f ->
+                            FolderCard(f, Modifier.animateItem()) { onOpen(f.key) }
+                        }
                     }
                 }
             }
         } else {
             val folder = folders.find { it.key == key } ?: folders.first()
-            val shown = remember(folder, query) {
-                folder.songs.filter {
-                    query.isBlank() || it.title.contains(query, true) ||
-                        it.artist.contains(query, true) || it.album.contains(query, true)
-                }
-            }
-            LibraryDetail(folder, shown, query, onQuery, currentId, playing, onBack = { onOpen(null) }, onPlay = onPlay)
+            val shown = remember(folder, query) { folder.songs.filter { matches(it, query) } }
+            LibraryDetail(folder, shown, query, onQuery, currentId, playing, st, onBack = { onOpen(null) }, onPlay = onPlay, onChanged = onChanged)
         }
+    }
+}
+
+@Composable
+private fun SettingRow(title: String, sub: String, danger: Boolean = false, onClick: () -> Unit) {
+    Column(
+        Modifier.bounceClick(0.98f, onClick).fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Hover)
+            .padding(horizontal = 14.dp, vertical = 12.dp)
+    ) {
+        Text(title, color = if (danger) Color(0xFFE5645F) else Cub.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Text(sub, color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+    }
+}
+
+@Composable
+private fun PlaylistSettingsPopup(
+    folder: Folder, recent: Recent?, hasCustom: Boolean, st: Settings,
+    onPickCover: () -> Unit, onDelete: () -> Unit, onClose: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    AnimatedPopup(onDismiss = onClose) { close ->
+        Text(folder.name, color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium,
+            maxLines = 2, overflow = TextOverflow.Ellipsis)
+        SettingRow("Change cover", "Pick a picture from your phone.") { onPickCover(); close() }
+        if (hasCustom) SettingRow("Reset cover", "Go back to the first song's cover.") { PlaylistCovers.remove(ctx, folder.key); close() }
+        if (recent != null) {
+            SettingRow("Sync now", "Download new songs from the original playlist.") {
+                CaveService.start(ctx, recent.url, false)
+                close()
+            }
+            ToggleCard(
+                "Auto-update",
+                "Check for new songs and download them in the background, even when the app is closed.",
+                recent.auto,
+            ) { on ->
+                val list = CaveState.recents.map { if (it.url == recent.url) it.copy(auto = on) else it }
+                CaveState.recents = list
+                CaveStore.save(ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE), list)
+                if (on) st.watch.set(true)
+                WatchService.sync(ctx)
+            }
+        } else if (folder.key.isNotEmpty()) {
+            Text("Sync and auto-update are for playlists downloaded from a link.", color = Cub.Muted, fontSize = 12.sp)
+        }
+        if (folder.key.isNotEmpty()) {
+            SettingRow("Delete playlist", "Removes its songs from your phone.", danger = true) { close(); onDelete() }
+        }
+        CubButton("Close") { close() }
     }
 }
 
 @Composable
 fun LibraryDetail(
     folder: Folder, shown: List<Song>, query: String, onQuery: (String) -> Unit,
-    currentId: String?, playing: Boolean, onBack: () -> Unit, onPlay: (List<Song>, Int) -> Unit,
+    currentId: String?, playing: Boolean, st: Settings,
+    onBack: () -> Unit, onPlay: (List<Song>, Int) -> Unit, onChanged: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    var showSettings by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) scope.launch(Dispatchers.IO) { PlaylistCovers.save(ctx, folder.key, uri) }
     }
     val custom = remember(PlaylistCovers.version) { PlaylistCovers.has(ctx, folder.key) }
+    val recent = CaveState.recents.firstOrNull { safeName(it.name) == folder.key }
+
     Column(Modifier.fillMaxSize()) {
-        Text(
-            "< Library", color = Cub.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.clickable(onClick = onBack).padding(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 4.dp),
-        )
+        Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "< Library", color = Cub.Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.clickable(onClick = onBack).padding(start = 12.dp, top = 12.dp, end = 16.dp, bottom = 8.dp),
+            )
+            Spacer(Modifier.weight(1f))
+            IconBtn(IconKind.Gear, 40.dp) { showSettings = true }
+        }
         Row(
             Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            FolderCover(folder.key, folder.songs.firstOrNull()?.id ?: -1L, Modifier.size(84.dp), 300)
+            FolderCover(folder.key, folder.songs.firstOrNull()?.id ?: -1L, Modifier.size(84.dp), 400)
             Column(Modifier.weight(1f)) {
                 Text(folder.name, color = Cub.Text, fontSize = 24.sp, fontFamily = Display, fontWeight = FontWeight.Medium,
                     maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -409,10 +481,8 @@ fun LibraryDetail(
                 )
             }
         }
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
             CubButton("Play", primary = true) { onPlay(shown, 0) }
-            CubButton("Cover") { pick.launch("image/*") }
-            if (custom) CubButton("Reset") { PlaylistCovers.remove(ctx, folder.key) }
         }
         Spacer(Modifier.height(8.dp))
         SearchBox(query, onQuery)
@@ -422,12 +492,43 @@ fun LibraryDetail(
                 color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(16.dp),
             )
         }
-        LazyColumn(
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
+        LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             itemsIndexed(shown, key = { _, s -> s.id }) { i, s ->
                 SongRow(s, s.id.toString() == currentId, playing, Modifier.animateItem()) { onPlay(shown, i) }
+            }
+        }
+    }
+
+    if (showSettings) {
+        PlaylistSettingsPopup(
+            folder, recent, custom, st,
+            onPickCover = { pick.launch("image/*") },
+            onDelete = { confirmDelete = true },
+            onClose = { showSettings = false },
+        )
+    }
+    if (confirmDelete) {
+        AnimatedPopup(onDismiss = { confirmDelete = false }) { close ->
+            Text("Delete \"${folder.name}\"?", color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+            Text(
+                "This deletes ${folder.songs.size} songs from your phone. Files that another app created may be kept.",
+                color = Cub.Muted, fontSize = 13.sp,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CubButton("Delete", primary = true) {
+                    close()
+                    scope.launch(Dispatchers.IO) {
+                        folder.songs.forEach {
+                            try { ctx.contentResolver.delete(songUri(it.id), null, null) } catch (_: Exception) {}
+                        }
+                        PlaylistCovers.remove(ctx, folder.key)
+                        val list = CaveState.recents.filter { safeName(it.name) != folder.key }
+                        CaveStore.save(ctx.getSharedPreferences("honeybeat", Context.MODE_PRIVATE), list)
+                        CaveState.ui { CaveState.recents = list; onChanged(); onBack() }
+                        WatchService.sync(ctx)
+                    }
+                }
+                CubButton("Cancel") { close() }
             }
         }
     }
@@ -440,7 +541,7 @@ fun FolderCard(f: Folder, modifier: Modifier = Modifier, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        FolderCover(f.key, f.songs.firstOrNull()?.id ?: -1L, Modifier.size(56.dp))
+        FolderCover(f.key, f.songs.firstOrNull()?.id ?: -1L, Modifier.size(56.dp), 320)
         Column(Modifier.weight(1f)) {
             Text(f.name, color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -461,7 +562,7 @@ fun SongRow(s: Song, current: Boolean, playing: Boolean, modifier: Modifier = Mo
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.width(3.dp).fillMaxHeight().background(bar))
-        Cover(s.id, 120, Modifier.padding(start = 10.dp).size(46.dp))
+        Cover(s.id, 256, Modifier.padding(start = 10.dp).size(46.dp))
         Column(Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 10.dp)) {
             Text(
                 s.title, color = titleColor, fontSize = 14.sp,
@@ -492,7 +593,7 @@ fun MiniPlayer(remote: Remote, onOpen: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Cover(id, 120, Modifier.size(42.dp))
+            Cover(id, 256, Modifier.size(42.dp))
             Column(Modifier.weight(1f)) {
                 Text(md?.title?.toString() ?: "", color = Cub.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -516,87 +617,131 @@ fun Chip(text: String, on: Boolean, onClick: () -> Unit) {
     ) { Text(text, color = c, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
 }
 
+/** Full-screen player: tinted from the cover, with a level animation and what plays next. */
 @Composable
-fun PlayingPage(
+fun PlayingScreen(
     remote: Remote, shuffle: Boolean, repeatAll: Boolean,
-    onShuffle: () -> Unit, onRepeat: () -> Unit,
+    onShuffle: () -> Unit, onRepeat: () -> Unit, onClose: () -> Unit,
 ) {
+    val ctx = LocalContext.current
     val item = remote.item
     val player = remote.player
-    // Anchored layout: cover fills the middle, title + seek bar + controls stay pinned at the bottom.
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = 24.dp).padding(top = 8.dp, bottom = 16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
+    val id = item?.mediaId?.toLongOrNull() ?: -1L
+
+    val tint by produceState(Cub.Panel, id) {
+        val b = Covers.load(ctx, id, 64)
+        value = if (b != null) {
+            val px = Bitmap.createScaledBitmap(b, 1, 1, true).getPixel(0, 0)
+            lerp(Color(px), Color.Black, 0.45f)
+        } else Cub.Panel
+    }
+    val tintAnim by animateColorAsState(tint, tween(600), label = "tint")
+
+    Box(
+        Modifier.fillMaxSize()
+            .background(Brush.verticalGradient(listOf(tintAnim, Cub.Panel, Cub.Black)))
+            .pointerInput(Unit) {},
     ) {
-        if (item == null) {
-            Spacer(Modifier.weight(1f))
-            Text("Nothing playing", color = Cub.Text, fontSize = 22.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
-            Text("Pick a song in the Library.", color = Cub.Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
-            Spacer(Modifier.weight(1f))
-            return@Column
-        }
-
-        val scale by animateFloatAsState(if (remote.playing) 1f else 0.9f, tween(300), label = "coverScale")
-        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            val side = minOf(maxWidth, maxHeight, 340.dp).coerceAtLeast(120.dp)
-            Cover(
-                item.mediaId.toLongOrNull() ?: -1L, 700,
-                Modifier.size(side).graphicsLayer { scaleX = scale; scaleY = scale },
-            )
-        }
-
-        val md = item.mediaMetadata
-        Crossfade(
-            targetState = (md.title?.toString() ?: "") to (md.artist?.toString() ?: ""),
-            animationSpec = tween(220), label = "titles",
-            modifier = Modifier.fillMaxWidth().height(84.dp),
-        ) { (title, artist) ->
-            Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                Text(title, color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium,
-                    textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text(artist, color = Cub.Muted, fontSize = 14.sp, textAlign = TextAlign.Center,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
-            }
-        }
-
-        var pos by remember { mutableLongStateOf(0L) }
-        var drag by remember { mutableStateOf<Float?>(null) }
-        LaunchedEffect(player) {
-            while (true) {
-                player?.let { pos = it.currentPosition }
-                delay(400)
-            }
-        }
-        val dur = (player?.duration ?: 0L).coerceAtLeast(0L)
-        val frac = drag ?: if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f
-        Column(Modifier.widthIn(max = 420.dp).fillMaxWidth()) {
-            Slider(
-                value = frac,
-                onValueChange = { drag = it },
-                onValueChangeFinished = {
-                    drag?.let { player?.seekTo((it * dur).toLong()) }
-                    drag = null
-                },
-                colors = SliderDefaults.colors(
-                    thumbColor = Cub.Accent, activeTrackColor = Cub.Accent, inactiveTrackColor = Cub.Button,
-                ),
-            )
-            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(fmt((frac * dur).toLong()), color = Cub.Muted, fontSize = 12.sp)
-                Text(fmt(dur), color = Cub.Muted, fontSize = 12.sp)
-            }
-        }
-
-        Row(
-            Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(top = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+        // Anchored layout: top bar, cover fills the middle, everything else is pinned at the bottom.
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()
+                .padding(horizontal = 24.dp).padding(top = 8.dp, bottom = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Chip("Shuffle", shuffle, onShuffle)
-            TBtn(G.Prev, 48.dp, 26.dp, Cub.Card, Cub.Text) { remote.prev() }
-            PlayPauseBtn(remote.playing, 64.dp, 32.dp) { remote.toggle() }
-            TBtn(G.Next, 48.dp, 26.dp, Cub.Card, Cub.Text) { remote.next() }
-            Chip("Repeat", repeatAll, onRepeat)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                IconBtn(IconKind.Down, 40.dp, Color.Black.copy(alpha = 0.35f)) { onClose() }
+                Spacer(Modifier.weight(1f))
+                Text("NOW PLAYING", color = Cub.Muted, fontSize = 12.sp, fontFamily = Display)
+                Spacer(Modifier.weight(1f))
+                Spacer(Modifier.size(40.dp))
+            }
+
+            if (item == null) {
+                Spacer(Modifier.weight(1f))
+                Text("Nothing playing", color = Cub.Text, fontSize = 22.sp, fontFamily = Display, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.weight(1f))
+                return@Column
+            }
+
+            val scale by animateFloatAsState(if (remote.playing) 1f else 0.9f, tween(300), label = "coverScale")
+            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                val side = minOf(maxWidth, maxHeight, 340.dp).coerceAtLeast(120.dp)
+                Cover(
+                    id, 1024,
+                    Modifier.size(side).graphicsLayer { scaleX = scale; scaleY = scale },
+                    corner = 12.dp,
+                )
+            }
+
+            val md = item.mediaMetadata
+            Crossfade(
+                targetState = (md.title?.toString() ?: "") to (md.artist?.toString() ?: ""),
+                animationSpec = tween(220), label = "titles",
+                modifier = Modifier.fillMaxWidth().height(84.dp),
+            ) { (title, artist) ->
+                Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                    Text(title, color = Cub.Text, fontSize = 20.sp, fontFamily = Display, fontWeight = FontWeight.Medium,
+                        textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(artist, color = Cub.Muted, fontSize = 14.sp, textAlign = TextAlign.Center,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
+                }
+            }
+
+            Visualizer(remote.playing, Cub.Accent)
+            Spacer(Modifier.height(10.dp))
+
+            var pos by remember { mutableLongStateOf(0L) }
+            var drag by remember { mutableStateOf<Float?>(null) }
+            LaunchedEffect(player) {
+                while (true) {
+                    player?.let { pos = it.currentPosition }
+                    delay(400)
+                }
+            }
+            val dur = (player?.duration ?: 0L).coerceAtLeast(0L)
+            val frac = drag ?: if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f
+            Column(Modifier.widthIn(max = 420.dp).fillMaxWidth()) {
+                Slider(
+                    value = frac,
+                    onValueChange = { drag = it },
+                    onValueChangeFinished = {
+                        drag?.let { player?.seekTo((it * dur).toLong()) }
+                        drag = null
+                    },
+                    colors = SliderDefaults.colors(
+                        thumbColor = Cub.Accent, activeTrackColor = Cub.Accent, inactiveTrackColor = Cub.Button,
+                    ),
+                )
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(fmt((frac * dur).toLong()), color = Cub.Muted, fontSize = 12.sp)
+                    Text(fmt(dur), color = Cub.Muted, fontSize = 12.sp)
+                }
+            }
+
+            Row(
+                Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(top = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Chip("Shuffle", shuffle, onShuffle)
+                TBtn(G.Prev, 48.dp, 26.dp, Cub.Card, Cub.Text) { remote.prev() }
+                PlayPauseBtn(remote.playing, 64.dp, 32.dp) { remote.toggle() }
+                TBtn(G.Next, 48.dp, 26.dp, Cub.Card, Cub.Text) { remote.next() }
+                Chip("Repeat", repeatAll, onRepeat)
+            }
+
+            val upNext = remember(item, player) {
+                player?.let { p ->
+                    if (p.hasNextMediaItem()) p.getMediaItemAt(p.nextMediaItemIndex).mediaMetadata.title?.toString() else null
+                }
+            }
+            Crossfade(upNext, animationSpec = tween(200), label = "next", modifier = Modifier.fillMaxWidth().height(34.dp)) { t ->
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                    if (t != null) {
+                        Text("Up next  -  $t", color = Cub.Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
         }
     }
 }
@@ -624,80 +769,98 @@ private fun ChoiceCard(title: String, sub: String, content: @Composable () -> Un
 }
 
 @Composable
-fun OptionsPage(
-    shuffle: Boolean, repeatAll: Boolean, showArt: Boolean, caveArt: Boolean, caveAsk: Boolean,
-    caveAuto: Boolean, cavePar: Int, caveQuality: String,
-    onShuffle: (Boolean) -> Unit, onRepeat: (Boolean) -> Unit, onArt: (Boolean) -> Unit,
-    onCaveArt: (Boolean) -> Unit, onCaveAsk: (Boolean) -> Unit, onCaveAuto: (Boolean) -> Unit,
-    onCavePar: (Int) -> Unit, onCaveQuality: (String) -> Unit,
-    onRescan: () -> Unit, songCount: Int, listCount: Int,
-) {
+private fun ActionCard(title: String, sub: String, button: String, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Text(sub, color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
+        }
+        CubButton(button, onClick = onClick)
+    }
+}
+
+@Composable
+fun OptionsPage(st: Settings, onRescan: () -> Unit, songCount: Int, listCount: Int, onLogin: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        PageTitle("Options", "How HoneyBeat and Fetch behave. Changes apply right away.")
+        PageTitle("Options", "How HoneyBeat behaves. Changes apply right away.")
 
         SectionLabel("PLAYBACK")
         Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            ToggleCard("Shuffle", "Play the queue in random order.", shuffle, onShuffle)
-            ToggleCard("Repeat all", "Start over when the last song ends.", repeatAll, onRepeat)
-            ToggleCard("Show cover art", "Covers in the lists and on the Playing page.", showArt, onArt)
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            ToggleCard("Shuffle", "Play the queue in random order.", st.shuffle.value) { st.shuffle.set(it) }
+            ToggleCard("Repeat all", "Start over when the last song ends.", st.repeat.value) { st.repeat.set(it) }
+            ToggleCard("Show cover art", "Covers in the lists and on the player.", st.art.value) { st.art.set(it) }
+            ActionCard("Library", "$songCount songs in $listCount playlists.", "Rescan", onRescan)
+        }
+
+        SectionLabel("YOUTUBE ACCOUNT")
+        Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionCard(
+                "YouTube",
+                if (CaveState.signedIn) "Signed in. Private playlists and importing your playlists are on."
+                else "Not signed in. Sign in for private playlists and importing your own.",
+                if (CaveState.signedIn) "Sign out" else "Sign in",
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Library", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                    Text("$songCount songs in $listCount playlists.", color = Cub.Muted, fontSize = 12.sp,
-                        modifier = Modifier.padding(top = 3.dp))
-                }
-                CubButton("Rescan", onClick = onRescan)
+                if (CaveState.signedIn) {
+                    YtAuth.clear(ctx)
+                    CaveState.signedIn = false
+                } else onLogin()
             }
         }
 
-        SectionLabel("FETCH")
+        SectionLabel("PLAYLIST UPDATES")
+        Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ToggleCard(
+                "Auto-update playlists",
+                "Keeps checking the playlists that have auto-update on and downloads new songs, even when the app is closed. Shows a small notification while on.",
+                st.watch.value,
+            ) { st.watch.set(it) }
+            ChoiceCard("Check every", "How often to look for new songs.") {
+                listOf(5 to "5 min", 15 to "15 min", 30 to "30 min", 60 to "1 hour").forEach { (n, label) ->
+                    Chip(label, st.every.value == n) { st.every.set(n); WatchService.sync(ctx) }
+                }
+            }
+            ToggleCard("Notify about new songs", "A notification when new songs are found or downloaded.", st.notify.value) { st.notify.set(it) }
+        }
+
+        SectionLabel("SEARCH AND DOWNLOADS")
         Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             ChoiceCard(
                 "Parallel downloads",
-                "How many songs download at the same time. All starts every song at once, which is fastest but heavy on the phone and battery.",
+                "How many songs download at the same time. All runs up to 20 at once, which is fastest but heavy on the phone and battery.",
             ) {
                 listOf(1 to "1", 2 to "2", 4 to "4", 8 to "8", 0 to "All").forEach { (n, label) ->
-                    Chip(label, cavePar == n) { onCavePar(n) }
+                    Chip(label, st.par.value == n) { st.par.set(n) }
                 }
             }
             ChoiceCard(
                 "Audio quality",
                 "MP3 320 kbps is the highest MP3 setting. Best original keeps the source audio as M4A with no extra lossy conversion.",
             ) {
-                Chip("MP3 320 kbps", caveQuality == "mp3") { onCaveQuality("mp3") }
-                Chip("Best original (M4A)", caveQuality == "m4a") { onCaveQuality("m4a") }
+                Chip("MP3 320 kbps", st.quality.value == "mp3") { st.quality.set("mp3") }
+                Chip("Best original (M4A)", st.quality.value == "m4a") { st.quality.set("m4a") }
             }
-            ToggleCard("Cover art in downloads", "Embeds the cover in each file. If it fails for a song, Fetch retries without it.", caveArt, onCaveArt)
-            ToggleCard("Ask on mobile data", "Ask before downloading on a metered connection.", caveAsk, onCaveAsk)
-            ToggleCard("Auto-update yt-dlp", "Updates the download engine by itself every 12 hours.", caveAuto, onCaveAuto)
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Cub.Card)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ToggleCard("Cover art in downloads", "Embeds the cover in each file. If it fails for a song, it retries without it.", st.caveArt.value) { st.caveArt.set(it) }
+            ToggleCard("Ask on mobile data", "Ask before downloading on a metered connection.", st.ask.value) { st.ask.set(it) }
+            ToggleCard("Auto-update yt-dlp", "Updates the download engine by itself every 12 hours.", st.autoYt.value) { st.autoYt.set(it) }
+            ActionCard(
+                "Update yt-dlp",
+                CaveState.updateMsg.ifEmpty { "Press Update if downloads start failing." },
+                if (CaveState.updating) "Updating..." else "Update",
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Update yt-dlp", color = Cub.Text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        CaveState.updateMsg.ifEmpty { "Press Update if downloads start failing." },
-                        color = Cub.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp),
-                    )
-                }
-                CubButton(if (CaveState.updating) "Updating..." else "Update") {
-                    if (!CaveState.updating && !CaveState.running) {
-                        CaveState.updating = true
-                        CaveState.updateMsg = "Updating..."
-                        scope.launch(Dispatchers.IO) {
-                            val msg = CaveEngine.update(ctx)
-                            CaveState.addLog(msg)
-                            CaveState.ui { CaveState.updateMsg = msg; CaveState.updating = false }
-                        }
+                if (!CaveState.updating && !CaveState.running) {
+                    CaveState.updating = true
+                    CaveState.updateMsg = "Updating..."
+                    scope.launch(Dispatchers.IO) {
+                        val msg = CaveEngine.update(ctx)
+                        CaveState.addLog(msg)
+                        CaveState.ui { CaveState.updateMsg = msg; CaveState.updating = false }
                     }
                 }
             }

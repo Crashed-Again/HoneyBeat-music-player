@@ -1,16 +1,19 @@
 # HoneyBeat
 
-HoneyBeat is a music player and a downloader (Fetch, the old Cave) in one Android app, styled like Cub by NeonBear.
+HoneyBeat is a music player and a downloader in one Android app, styled like Cub by NeonBear.
 
-- **Library**: "All music" plus one playlist for every folder in `Music/Cave` (`Music/Cave/Road Trip` is a playlist called Road Trip).
-  Songs and playlists share one tab, with album covers. Open a playlist and press **Cover** to give it your own picture.
-- **Playing**: cover in the middle, title, seek bar and controls pinned at the bottom. On other tabs a mini player
-  has previous / play / next.
-- **Fetch**: paste a YouTube Music, Spotify or Apple Music playlist link, or search for a song and press **Get**.
-  Files go to `Music/Cave`. Playlists keep their own folder, searched songs go straight into All music.
-  Sync only downloads new songs.
-- **Options**: playback settings and every Fetch setting: parallel downloads (1, 2, 4, 8 or all at once), audio quality
-  (MP3 320 kbps or best original M4A), cover art in downloads, ask on mobile data, auto-update yt-dlp, Update yt-dlp.
+**Tabs:** Library, Search, Options. Playing is not a tab: a mini player sits above the bottom bar whenever a song is loaded
+(cover, previous / play / next). Tap it to open the full player.
+
+- **Library**: "All music" plus one playlist per folder in `Music/Cave`. Search works across everything. Open a playlist and
+  press the gear for: change / reset cover, Sync now, Auto-update, Delete playlist.
+- **Player**: tinted from the cover, animated level bars, seek bar, shuffle / repeat, and what plays next.
+- **Search**: type a song, press the search button, press **Get** to download it (queue as many as you like).
+  The small download button next to it opens the playlist popup: paste a YouTube Music, Spotify or Apple Music link.
+  When you are signed in it also has **Import from my YouTube**, which downloads a playlist of yours with its cover and
+  keeps it updated.
+- **Options**: playback, YouTube account (sign in / out), playlist updates (on/off, check every 5 / 15 / 30 / 60 min,
+  notifications), and download settings (parallel downloads, quality, cover art, mobile data, yt-dlp).
 
 Needs Android 10 or newer.
 
@@ -25,9 +28,15 @@ Other ways: Android Studio (Build > Build APK(s)), or `build-apk.bat` (result in
 
 ## Notes
 
-- Playlists must be public. Spotify's public page only exposes about 100 tracks.
+- Auto-update runs as a small foreground service (a quiet notification) while it is on, so Android lets it keep checking
+  when the app is closed. It restarts after a reboot.
+- YouTube sign-in uses an in-app page; Google sometimes refuses sign-ins in embedded browsers. yt-dlp can get an account
+  rate-limited, so a spare account is safer. Sign out deletes the saved session.
+- "All" parallel downloads runs up to 20 at once. Every download is a separate Python + ffmpeg process, and Android kills
+  the app when there are too many.
+- Playlists must be public (or you signed in). Spotify's public page only exposes about 100 tracks.
 - Spotify and Apple Music songs are searched on YouTube, so the match can occasionally be a wrong version.
 - YouTube audio is lossy to begin with, so MP3 320 kbps is the highest MP3 setting but not better than the source.
-- If downloads start failing, press **Update yt-dlp** in Options. The red "Last error" line and the Log card in Fetch show why a song failed.
+- If downloads fail, press **Update yt-dlp** in Options. The red "Last error" line and the Log card in Search say why.
 - Fonts: Tektur and Outfit, both under the SIL Open Font License (see `licenses/`).
 - Only download music you have the right to copy.
