@@ -1,4 +1,4 @@
-name: Build HoneyBeat APK
+name: Build HoneyBeat (Metrolist-based)
 
 on:
   workflow_dispatch:
@@ -8,41 +8,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout this repo (scripts + overlay)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream Metrolist
+        run: git clone --depth 1 --recurse-submodules https://github.com/MetrolistGroup/Metrolist.git upstream
+
+      - name: Rename Metrolist -> HoneyBeat
+        working-directory: upstream
+        run: bash ../rename_to_honeybeat.sh
+
+      - name: Add HoneyBeat UI kit
+        run: |
+          mkdir -p upstream/app/src/main/kotlin/com/neonbear/honeybeat/ui
+          cp overlay/HoneyBeatUi.kt upstream/app/src/main/kotlin/com/neonbear/honeybeat/ui/HoneyBeatUi.kt
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
 
-      # YouTube needs a JavaScript runtime before it gives out audio. QuickJS is one small static program per CPU type;
-      # the app finds it as libqjs.so and hands it to yt-dlp (see JsRuntime in CaveCore.kt).
-      - name: Fetch QuickJS (JavaScript runtime for yt-dlp)
+      - name: Build debug APK(s)
+        working-directory: upstream
         run: |
-          base=https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0
-          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
-          curl -fL --retry 3 "$base/qjs-linux-aarch64" -o app/src/main/jniLibs/arm64-v8a/libqjs.so
-          curl -fL --retry 3 "$base/qjs-linux-armv7" -o app/src/main/jniLibs/armeabi-v7a/libqjs.so
-          for f in app/src/main/jniLibs/*/libqjs.so; do
-            file "$f"
-            if readelf -l "$f" | grep -q INTERP; then
-              echo "::warning::$f is dynamically linked, so it may not start on Android (the app then falls back to the old download method)"
-            fi
-          done
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: Build debug APK
-        run: gradle --no-daemon assembleDebug
-
-      - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk HoneyBeat.apk
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK(s)
+        uses: actions/upload-artifact@v4
         with:
           name: HoneyBeat-apk
-          path: HoneyBeat.apk
+          path: upstream/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
