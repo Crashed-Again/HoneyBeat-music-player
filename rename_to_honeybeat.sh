@@ -1,61 +1,35 @@
 #!/usr/bin/env bash
-# Run from the ROOT of a fresh clone of MetrolistGroup/Metrolist:
-#   git clone https://github.com/MetrolistGroup/Metrolist HoneyBeat && cd HoneyBeat
-#   bash rename_to_honeybeat.sh
-# Metrolist is GPL-3.0: LICENSE stays untouched and the source must stay public.
+# Run from the ROOT of a clone of MetrolistGroup/Metrolist.
+# v2: does NOT rename Kotlin packages/classes (that broke the build: git submodules and
+# generated code still use com.metrolist). It renames what users actually see:
+# app name, application id, icon. Metrolist is GPL-3.0 - LICENSE stays untouched.
 set -euo pipefail
 
-NEW_PKG="com.neonbear.honeybeat"
+NEW_APPID="com.neonbear.honeybeat.ytm"
 
-echo "==> 1/4 Replacing text inside files"
-git ls-files -z | while IFS= read -r -d '' f; do
-  case "$f" in LICENSE|README.md|changelog.md) continue ;; esac
-  [ -f "$f" ] || continue
-  grep -Iq . "$f" 2>/dev/null || continue            # skip binaries / empty files
-  perl -pi -e '
-    # protect upstream services the app talks to (listen-together, update links, org)
-    s{github\.com/MetrolistGroup}{__KEEP_GH__}g;
-    s{metrolist\.cc}{__KEEP_CC__}g;
-    s{metroserver}{__KEEP_MS__}g;
-    s{MetrolistGroup}{__KEEP_MG__}g;
-    # the actual rename
-    s{com\.metrolist}{'"$NEW_PKG"'}g;
-    s{Metrolist}{HoneyBeat}g;
-    s{METROLIST}{HONEYBEAT}g;
-    s{metrolist}{honeybeat}g;
-    # restore protected strings
-    s{__KEEP_GH__}{github.com/MetrolistGroup}g;
-    s{__KEEP_CC__}{metrolist.cc}g;
-    s{__KEEP_MS__}{metroserver}g;
-    s{__KEEP_MG__}{MetrolistGroup}g;
-  ' "$f"
-done
+echo "==> 1/3 App name in string resources (all languages) and manifest labels"
+find app/src -type f -path '*/res/values*/strings*.xml' -print0 | xargs -0 -r perl -pi -e '
+  s{github\.com/MetrolistGroup}{__KEEP_GH__}g;
+  s{MetrolistGroup}{__KEEP_MG__}g;
+  s{metrolist\.cc}{__KEEP_CC__}g;
+  s{Metrolist}{HoneyBeat}g;
+  s{__KEEP_GH__}{github.com/MetrolistGroup}g;
+  s{__KEEP_MG__}{MetrolistGroup}g;
+  s{__KEEP_CC__}{metrolist.cc}g;
+'
+find app/src -type f -name 'AndroidManifest.xml' -print0 | xargs -0 -r perl -pi -e \
+  's{(android:label="[^"]*)Metrolist}{$1HoneyBeat}g'
 
-echo "==> 2/4 Moving package folders com/metrolist -> com/neonbear/honeybeat"
-find . -type d -path '*/com/metrolist' -not -path './.git/*' -prune | while read -r d; do
-  parent="$(dirname "$d")"                            # .../com
-  mkdir -p "$parent/neonbear"
-  git mv "$d" "$parent/neonbear/honeybeat"
-done
+echo "==> 2/3 Application id -> $NEW_APPID"
+perl -pi -e 's{(applicationId\s*=\s*)"[^"]*"}{$1"'"$NEW_APPID"'"}' app/build.gradle.kts
+grep -n 'applicationId' app/build.gradle.kts || echo "WARNING: no applicationId line found"
 
-echo "==> 3/4 Renaming files and folders that still have 'metrolist' in the name"
-find . -depth -iname '*metrolist*' -not -path './.git/*' -not -name LICENSE | while read -r p; do
-  dir="$(dirname "$p")"; base="$(basename "$p")"
-  new="$(echo "$base" | sed -e 's/Metrolist/HoneyBeat/g' -e 's/metrolist/honeybeat/g' -e 's/METROLIST/HONEYBEAT/g')"
-  [ "$base" != "$new" ] && git mv "$p" "$dir/$new"
-done
-
-echo "==> 4/4 Attribution notice"
-cat > NOTICE.md <<'EOF'
+echo "==> 3/3 Attribution notice"
+cat > NOTICE.md <<'EON'
 # HoneyBeat
 
 HoneyBeat by NeonBear is based on [Metrolist](https://github.com/MetrolistGroup/Metrolist)
 by Mo Agamy and contributors, licensed under GPL-3.0. This project is distributed under
 the same license (see LICENSE). Not affiliated with YouTube, Google or Metrolist Group.
-EOF
-
-echo
-echo "Done. Next:"
-echo "  1. Check app/build.gradle.kts -> applicationId (should be $NEW_PKG or $NEW_PKG.music)"
-echo "  2. Point the in-app update checker at YOUR repo (grep -r MetrolistGroup app/src)"
-echo "  3. Add the UI file, commit, push, build in GitHub Actions"
+EON
+echo "Done."

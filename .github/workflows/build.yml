@@ -16,12 +16,19 @@ jobs:
       - name: Clone upstream Metrolist
         run: git clone --depth 1 --recurse-submodules https://github.com/MetrolistGroup/Metrolist.git upstream
 
-      - name: Rename Metrolist -> HoneyBeat
+      - name: Rename app (name + application id)
         working-directory: upstream
         run: bash ../rename_to_honeybeat.sh
 
-      - name: Add HoneyBeat UI kit
+      - name: Apply HoneyBeat logo and UI kit
         run: |
+          # logo resources
+          cp -r overlay/res/. upstream/app/src/main/res/
+          # overwrite every existing adaptive launcher icon definition
+          find upstream/app/src -path '*mipmap-anydpi*' -name 'ic_launcher*.xml' | while read -r f; do
+            cp overlay/res/mipmap-anydpi-v26/ic_launcher.xml "$f"
+          done
+          # UI kit (theme, cards, floating nav, NeonBear footer)
           mkdir -p upstream/app/src/main/kotlin/com/neonbear/honeybeat/ui
           cp overlay/HoneyBeatUi.kt upstream/app/src/main/kotlin/com/neonbear/honeybeat/ui/HoneyBeatUi.kt
 
@@ -30,15 +37,23 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      - name: Create debug keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK(s)
+      - name: Build debug APK
         working-directory: upstream
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon
 
-      - name: Upload APK(s)
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: HoneyBeat-apk
