@@ -1,61 +1,36 @@
-name: Build HoneyBeat (Metrolist-based)
+name: Build HoneyBeat
 
 on:
-  workflow_dispatch:
   push:
     branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
-      - name: Checkout this repo (scripts + overlay)
-        uses: actions/checkout@v4
-
-      - name: Clone upstream Metrolist
-        run: git clone --depth 1 --recurse-submodules https://github.com/MetrolistGroup/Metrolist.git upstream
-
-      - name: Rename app (name + application id)
-        working-directory: upstream
-        run: bash ../rename_to_honeybeat.sh
-
-      - name: Apply HoneyBeat logo and UI kit
-        run: |
-          # logo resources
-          cp -r overlay/res/. upstream/app/src/main/res/
-          # overwrite every existing adaptive launcher icon definition
-          find upstream/app/src -path '*mipmap-anydpi*' -name 'ic_launcher*.xml' | while read -r f; do
-            cp overlay/res/mipmap-anydpi-v26/ic_launcher.xml "$f"
-          done
-          # UI kit (theme, cards, floating nav, NeonBear footer)
-          mkdir -p upstream/app/src/main/kotlin/com/neonbear/honeybeat/ui
-          cp overlay/HoneyBeatUi.kt upstream/app/src/main/kotlin/com/neonbear/honeybeat/ui/HoneyBeatUi.kt
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
-
-      - name: Create debug keystore
-        run: |
-          mkdir -p ~/.android
-          keytool -genkeypair -v -keystore ~/.android/debug.keystore \
-            -storepass android -keypass android -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          java-version: 17
 
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
 
-      - name: Build debug APK
-        working-directory: upstream
+      - name: Download fonts (Outfit + Oxanium)
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          mkdir -p app/src/main/assets/fonts
+          curl -fsSL "https://github.com/google/fonts/raw/main/ofl/outfit/Outfit%5Bwght%5D.ttf" -o app/src/main/assets/fonts/outfit.ttf || rm -f app/src/main/assets/fonts/outfit.ttf
+          curl -fsSL "https://github.com/google/fonts/raw/main/ofl/oxanium/Oxanium%5Bwght%5D.ttf" -o app/src/main/assets/fonts/oxanium.ttf || rm -f app/src/main/assets/fonts/oxanium.ttf
+          ls -la app/src/main/assets/fonts
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Build release APK
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
         with:
           name: HoneyBeat-apk
-          path: upstream/app/build/outputs/apk/**/*.apk
-          if-no-files-found: error
+          path: app/build/outputs/apk/release/*.apk

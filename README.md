@@ -1,12 +1,19 @@
-# HoneyBeat CI
+# HoneyBeat
 
-HoneyBeat by NeonBear, based on Metrolist (GPL-3.0).
+YouTube Music client for Android. Search songs, stream them, and download them into
+`Music/HoneyBeat/<playlist>` - every folder there shows up as a playlist in the Library.
 
-1. Create a new GitHub repo and upload everything in this zip (keep the `.github` folder).
-2. Actions tab -> "Build HoneyBeat (Metrolist-based)" -> Run workflow.
-3. Download the **HoneyBeat-apk** artifact.
+## Build on GitHub
+1. Create a repo and upload everything in this folder (keep the `.github` folder).
+2. Open the **Actions** tab -> **Build HoneyBeat** -> wait for the green check.
+3. Download the `HoneyBeat-apk` artifact, unzip, install `app-release.apk`.
 
-The workflow clones the latest Metrolist, renames the app (name + application id
-`com.neonbear.honeybeat.ytm`, so it installs next to your other HoneyBeat), swaps in the
-HoneyBeat logo from `overlay/res`, adds `overlay/HoneyBeatUi.kt`, creates a debug keystore
-and builds a debug APK. Keep this repo public (GPL-3.0).
+No Gradle wrapper needed: the workflow installs Gradle 8.9 and downloads the Outfit/Oxanium fonts.
+
+## If search or playback breaks
+YouTube changes often. Bump `newPipeExtractorVersion` in `app/build.gradle.kts` to the newest
+release from https://github.com/TeamNewPipe/NewPipeExtractor/releases and push again.
+
+## Credits
+Powered by [NewPipe Extractor](https://github.com/TeamNewPipe/NewPipeExtractor) (GPL-3.0), so this
+project is GPL-3.0 as well. By NeonBear.
